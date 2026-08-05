@@ -30,7 +30,8 @@ jobs:
       - name: Build portable package and installer
         shell: bash
         run: |
-          mkdir -p src/Plugins/SystemCPlugin/SystemCModule/lib
+          rm src/Plugins/SystemCPlugin/SystemCModule/lib/socket-cpp
+          mkdir -p src/Plugins/SystemCPlugin/SystemCModule/lib/socket-cpp
           ./build.sh -t
 
       - name: Upload Windows packages
