@@ -29,7 +29,9 @@ jobs:
 
       - name: Build portable package and installer
         shell: bash
-        run: ./build.sh -t
+        run: |
+          mkdir -p src/Plugins/SystemCPlugin/SystemCModule/lib
+          ./build.sh -t
 
       - name: Upload Windows packages
         uses: actions/upload-artifact@v4
