@@ -29,7 +29,7 @@ jobs:
 
       - name: Build portable package and installer
         shell: bash
-        run: ./build.sh -p -t --skip-fetch
+        run: ./build.sh -p -t
 
       - name: Upload Windows packages
         uses: actions/upload-artifact@v4
