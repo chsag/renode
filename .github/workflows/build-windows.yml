@@ -1,0 +1,39 @@
+name: Build Windows
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          choco install mingw cmake innosetup --no-progress --yes
+          'C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin' | Out-File -FilePath $env:GITHUB_PATH -Append
+          'C:\Program Files (x86)\Inno Setup 6' | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Build portable package and installer
+        shell: bash
+        run: ./build.sh -p -t --skip-fetch
+
+      - name: Upload Windows packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: renode-windows
+          path: output/packages/*
+          if-no-files-found: error
