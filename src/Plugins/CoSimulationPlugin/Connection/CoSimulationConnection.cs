@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -27,7 +27,7 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
         public static void ConnectToCoSimulation(this Emulation _,
                                                  string machineName,
                                                  string name = null,
-                                                 long frequency = DefaultTimeunitFrequency,
+                                                 ulong frequency = DefaultTimeunitFrequency,
                                                  ulong limitBuffer = DefaultLimitBuffer,
                                                  int timeout = DefaultTimeout,
                                                  int exitTimeout = DefaultExitTimeout,
@@ -58,7 +58,7 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
     {
         public CoSimulationConnection(IMachine machine,
                 string name,
-                long frequency,
+                ulong frequency,
                 ulong limitBuffer,
                 int timeout,
                 int exitTimeout,
@@ -96,6 +96,7 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
                 this.Log(LogLevel.Warning, "The co-simulated peripheral is already connected.");
                 return;
             }
+            afterDisconnectRequest.Reset();
             cosimConnection.Connect();
         }
 
@@ -126,6 +127,7 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
                 timer.Reset();
             }
             Send(null, ActionType.ResetPeripheral, 0, 0);
+            afterDisconnectRequest.Reset();
         }
 
         public void SendGPIO(int number, bool value)
@@ -193,15 +195,17 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
 
         public void DisconnectAll()
         {
-            /* After this operation then only way to use this perpiheral is to connect again.
+            /* After this operation then only way to use this peripheral is to connect again.
                Most important reason to call it is to make sure we won't block cleaning the emulation until connection timeout */
+            if(afterDisconnectRequest.IsSet)
+            {
+                return;
+            }
+            afterDisconnectRequest.Set();
             timer?.Reset();
             timer = null;
 
-            Monitor.Enter(abortInitiated);
             cosimConnection?.Abort();
-            Monitor.Exit(abortInitiated);
-
             allTicksProcessedARE?.Set();
         }
 
@@ -218,9 +222,10 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
             get => SimulationContext;
             set
             {
-#if PLATFORM_LINUX
-                SimulationContext = value;
-#endif
+                if(RuntimeInfo.IsLinux())
+                {
+                    SimulationContext = value;
+                }
             }
         }
 
@@ -229,9 +234,10 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
             get => SimulationContext;
             set
             {
-#if PLATFORM_WINDOWS
-                SimulationContext = value;
-#endif
+                if(RuntimeInfo.IsWindows())
+                {
+                    SimulationContext = value;
+                }
             }
         }
 
@@ -240,9 +246,10 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
             get => SimulationContext;
             set
             {
-#if PLATFORM_OSX
-                SimulationContext = value;
-#endif
+                if(RuntimeInfo.IsMacOS())
+                {
+                    SimulationContext = value;
+                }
             }
         }
 
@@ -260,9 +267,10 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
             get => simulationFilePath;
             set
             {
-#if PLATFORM_LINUX
-                SimulationFilePath = value;
-#endif
+                if(RuntimeInfo.IsLinux())
+                {
+                    SimulationFilePath = value;
+                }
             }
         }
 
@@ -271,9 +279,10 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
             get => simulationFilePath;
             set
             {
-#if PLATFORM_WINDOWS
-                SimulationFilePath = value;
-#endif
+                if(RuntimeInfo.IsWindows())
+                {
+                    SimulationFilePath = value;
+                }
             }
         }
 
@@ -282,9 +291,10 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
             get => simulationFilePath;
             set
             {
-#if PLATFORM_OSX
-                SimulationFilePath = value;
-#endif
+                if(RuntimeInfo.IsMacOS())
+                {
+                    SimulationFilePath = value;
+                }
             }
         }
 
@@ -447,7 +457,7 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
             }
         }
 
-        private ICoSimulationConnection SetupConnection(string address, int timeout, int exitTimeout, long frequency, ulong limitBuffer, int mainListenPort, int asyncListenPort, string stdoutFile, string stderrFile, LogLevel renodeLogLevel)
+        private ICoSimulationConnection SetupConnection(string address, int timeout, int exitTimeout, ulong frequency, ulong limitBuffer, int mainListenPort, int asyncListenPort, string stdoutFile, string stderrFile, LogLevel renodeLogLevel)
         {
             ICoSimulationConnection cosimConnection = null;
             if(address != null)
@@ -472,12 +482,16 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
                 timer = new LimitTimer(machine.ClockSource, frequency, null, LimitTimerName, limitBuffer, enabled: true, eventEnabled: true, autoUpdate: true);
                 timer.LimitReached += () =>
                 {
-                    if(!cosimConnection.TrySendMessage(new ProtocolMessage(ActionType.TickClock, 0, limitBuffer, ProtocolMessage.NoPeripheralIndex)))
+                    if(afterDisconnectRequest.IsSet)
+                    {
+                        return;
+                    }
+                    if(true != cosimConnection?.TrySendMessage(new ProtocolMessage(ActionType.TickClock, 0, limitBuffer, ProtocolMessage.NoPeripheralIndex)))
                     {
                         AbortAndLogError("Failed to send or didn't receive TickClock action response.");
                     }
                     this.NoisyLog("Tick: TickClock sent, waiting for the verilated peripheral...");
-                    if(!allTicksProcessedARE.WaitOne(timeout))
+                    if(true != allTicksProcessedARE?.WaitOne(timeout))
                     {
                         AbortAndLogError("Timeout reached while waiting for a tick response.");
                     }
@@ -491,10 +505,10 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
         private void AbortAndLogError(string message)
         {
             this.Log(LogLevel.Error, message);
-            if(Monitor.TryEnter(abortInitiated))
+            if(!afterDisconnectRequest.IsSet)
             {
-                cosimConnection.Abort();
-                Monitor.Exit(abortInitiated);
+                // This method is thread-safe and can be called many times.
+                cosimConnection?.Abort();
             }
             // Due to deadlock, we need to abort CPU instead of pausing emulation.
             throw new CpuAbortException();
@@ -513,9 +527,9 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
         private LimitTimer timer;
         private AutoResetEvent allTicksProcessedARE;
         private string simulationFilePath;
+        private readonly ManualResetEventSlim afterDisconnectRequest = new ManualResetEventSlim(false);
         private readonly IMachine machine;
         private readonly List<GPIOEntry> gpioEntries;
-        private readonly Object abortInitiated = new Object();
 
         private readonly ICoSimulationConnection cosimConnection;
 

@@ -5,23 +5,20 @@
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
-using System.Diagnostics;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Runtime.InteropServices;
 
-using Antmicro.Renode.Logging;
+using Antmicro.Renode.Core;
 using Antmicro.Renode.Exceptions;
+using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Plugins.CoSimulationPlugin.Connection.Protocols;
-
-#if !PLATFORM_WINDOWS
-using Mono.Unix.Native;
-#endif
 
 namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
 {
@@ -144,11 +141,16 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
             }
 
             asyncSocketCommunicator.CancelCommunication();
-            lock(receiveThreadLock)
+
+            // `Abort()` can be called from the receive thread, join would result in a deadlock
+            if(Thread.CurrentThread != receiveThread)
             {
-                if(receiveThread.IsAlive)
+                lock(receiveThreadLock)
                 {
-                    receiveThread.Join(connectionTimeout);
+                    if(receiveThread.IsAlive)
+                    {
+                        receiveThread.Join(connectionTimeout);
+                    }
                 }
             }
 
@@ -217,9 +219,6 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
                 parentElement.Log(LogLevel.Debug,
                     "Trying to run and connect to the cosimulated peripheral '{0}' through ports {1} and {2}...",
                     value, mainSocketCommunicator.ListenerPort, asyncSocketCommunicator.ListenerPort);
-#if !PLATFORM_WINDOWS
-                Mono.Unix.Native.Syscall.chmod(value, FilePermissions.S_IRWXU); //setting permissions to 0x700
-#endif
                 InitCoSimulatedProcess(value);
             }
         }
@@ -264,6 +263,11 @@ namespace Antmicro.Renode.Plugins.CoSimulationPlugin.Connection
         {
             try
             {
+                if(!RuntimeInfo.IsWindows())
+                {
+                    File.SetUnixFileMode(filePath, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+                }
+
                 bool redirectStdoutToFile = !String.IsNullOrWhiteSpace(stdoutFile);
                 bool redirectStderrToFile = !String.IsNullOrWhiteSpace(stderrFile);
                 bool redirectOutputToLog = renodeLogLevel != null;

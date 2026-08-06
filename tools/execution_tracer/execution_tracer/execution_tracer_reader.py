@@ -14,6 +14,8 @@ import platform
 import sys
 import os
 import gzip
+import urllib.request
+import urllib.error
 from enum import Enum
 from dataclasses import dataclass
 from typing import IO, BinaryIO, NamedTuple, Optional
@@ -29,10 +31,11 @@ except ImportError:
     import coverview_integration
 
 FILE_SIGNATURE = b"ReTrace"
-FILE_VERSION = b"\x04"
+FILE_VERSION = b"\x05"
 HEADER_LENGTH = 10
 MEMORY_ACCESS_LENGTH = 25
 RISCV_VECTOR_CONFIGURATION_LENGTH = 16
+BYTE_ORDER = "little"
 
 
 class AdditionalDataType(Enum):
@@ -40,6 +43,7 @@ class AdditionalDataType(Enum):
     MemoryAccess = 1
     RiscVVectorConfiguration = 2
     RiscVAtomicInstruction = 3
+    Registers = 4
 
 
 class MemoryAccessType(Enum):
@@ -73,12 +77,11 @@ class Header:
     pc_length: int
     has_opcodes: bool
     extra_length: int = 0
-    uses_multiple_instruction_sets: bool = False
-    triple_and_model: Optional[str] = None
+    triple_and_models: tuple[str] = ()
 
     def __str__(self) -> str:
-        return "Header: pc_length: {}, has_opcodes: {}, extra_length: {}, uses_multiple_instruction_sets: {}, triple_and_model: {}".format(
-            self.pc_length, self.has_opcodes, self.extra_length, self.uses_multiple_instruction_sets, self.triple_and_model)
+        return "Header: pc_length: {}, has_opcodes: {}, extra_length: {}, triple_and_models: {}".format(
+            self.pc_length, self.has_opcodes, self.extra_length, self.triple_and_models)
 
 
 def read_header(file: BinaryIO) -> Header:
@@ -95,23 +98,32 @@ def read_header(file: BinaryIO) -> Header:
         raise InvalidFileFormatException("Invalid file header")
 
     if opcodes_raw[0] == 0:
-        return Header(pc_length_raw[0], False, 0, False, None)
+        return Header(pc_length_raw[0], False, 0, ())
     elif opcodes_raw[0] == 1:
-        uses_multiple_instruction_sets_raw = file.read(1)
-        identifier_length_raw = file.read(1)
-        if len(uses_multiple_instruction_sets_raw) != 1 or len(identifier_length_raw) != 1:
+        triple_and_model_count_raw = file.read(1)
+        if len(triple_and_model_count_raw) != 1:
             raise InvalidFileFormatException("Invalid file header")
-        
-        uses_multiple_instruction_sets = uses_multiple_instruction_sets_raw[0] == 1
-        identifier_length = identifier_length_raw[0]
-        triple_and_model_raw = file.read(identifier_length)
-        if len(triple_and_model_raw) != identifier_length:
-            raise InvalidFileFormatException("Invalid file header")
-            
-        triple_and_model = triple_and_model_raw.decode("utf-8")
-        extra_length = 2 + identifier_length
+        triple_and_model_count = triple_and_model_count_raw[0]
 
-        return Header(pc_length_raw[0], True, extra_length, uses_multiple_instruction_sets, triple_and_model)
+        extra_length = 1
+        triple_and_models = []
+
+        for _ in range(triple_and_model_count):
+            identifier_length_raw = file.read(1)
+            if len(identifier_length_raw) != 1:
+                raise InvalidFileFormatException("Invalid file header")
+            identifier_length = identifier_length_raw[0]
+
+            triple_and_model_raw = file.read(identifier_length)
+            if len(triple_and_model_raw) != identifier_length:
+                raise InvalidFileFormatException("Invalid file header")
+
+            triple_and_model = triple_and_model_raw.decode("utf-8")
+
+            triple_and_models.append(triple_and_model)
+            extra_length += 1 + identifier_length
+
+        return Header(pc_length_raw[0], True, extra_length, tuple(triple_and_models))
     else:
         raise InvalidFileFormatException("Invalid opcodes field at file header")
 
@@ -122,9 +134,17 @@ def read_file(file: BinaryIO, disassemble: bool, llvm_disas_path: Optional[str])
 
 
 def bytes_to_hex(bytes: bytes, zero_padded=True) -> str:
-    integer = int.from_bytes(bytes, byteorder="little", signed=False)
+    integer = int.from_bytes(bytes, byteorder=BYTE_ORDER, signed=False)
     format_string = "0{}X".format(len(bytes)*2) if zero_padded else "X"
     return "0x{0:{fmt}}".format(integer, fmt=format_string)
+
+def bytes_to_thumb_hex(bytes: bytes) -> str:
+    if len(bytes) != 4:
+        return bytes_to_hex(bytes)
+    # Long Thumb instructions are effectively mixed endian - they're two pairs of 16bit ints
+    high = int.from_bytes(bytes[0:2], byteorder="little", signed=False)
+    low = int.from_bytes(bytes[2:4], byteorder="little", signed=False)
+    return f"0x{high:04X}{low:04X}"
 
 class TraceEntry(NamedTuple):
     pc: bytes
@@ -133,9 +153,9 @@ class TraceEntry(NamedTuple):
     isa_mode: int
 
 class TraceData:
-    disassemblers: Optional[dict[int, 'LLVMDisassembler']] = None
-    isa_mode: int = 0
+    disassemblers: dict[str, LLVMDisassembler] = {}
     instructions_left_in_block = 0
+    active_triple_and_model: str = None
 
     def __init__(self, file: IO, header: Header, disassemble: bool, llvm_disas_path: Optional[str]):
         self.file = file
@@ -143,27 +163,33 @@ class TraceData:
         self.has_pc = (self.pc_length != 0)
         self.has_opcodes = bool(header.has_opcodes)
         self.extra_length = header.extra_length
-        self.uses_multiple_instruction_sets = header.uses_multiple_instruction_sets
-        self.triple_and_model = header.triple_and_model
+        self.triple_and_models = header.triple_and_models
+        self.multiple_triple_and_models = len(header.triple_and_models) > 1
+        if len(header.triple_and_models) == 1:
+            self.active_triple_and_model = header.triple_and_models[0]
         self.disassemble = disassemble
         self.filename = os.path.basename(file.name).split('.')[0]
+        self.llvm_disas_path = llvm_disas_path
         if self.disassemble:
-            if not header.triple_and_model:
+            if len(header.triple_and_models) == 0:
                 raise RuntimeError("No architecture triple available in disassembly mode. Trace file might be corrupted")
             if not llvm_disas_path:
                 raise RuntimeError("No path to decompiler library provided")
-            triple, model = header.triple_and_model.split(" ")
-            self.disassemblers = {0: LLVMDisassembler(triple, model, llvm_disas_path)}
-            if self.uses_multiple_instruction_sets:
-                if triple == "armv7a":
-                    # For armv7a the flags are only 1 bit: 0 = ARM, 1 = thumb
-                    self.disassemblers[0b01] = LLVMDisassembler("thumb", model, llvm_disas_path)
-                elif triple == "arm64":
-                    # For arm64 there are two flags: bit[0] means Thumb and bit[1] means AArch32.
-                    # The valid values are 00, 10, and 11 (no 64-bit Thumb).
-                    self.disassemblers[0b10] = LLVMDisassembler("armv7a", model, llvm_disas_path)
-                    self.disassemblers[0b11] = LLVMDisassembler("thumb", model, llvm_disas_path)
 
+    def update_triple_and_model(self, idx: int):
+        if idx >= len(self.triple_and_models):
+            raise RuntimeError(f"Invalid triple_and_model index {idx} (out of {len(self.triple_and_models)})")
+        self.active_triple_and_model = self.triple_and_models[idx]
+
+    def get_disas(self, triple_and_model: str) -> LLVMDisassembler:
+        if triple_and_model in self.disassemblers:
+            return self.disassemblers[triple_and_model]
+
+        triple, model = triple_and_model.split(" ")
+
+        disas = LLVMDisassembler(triple, model, self.llvm_disas_path)
+        self.disassemblers[triple_and_model] = disas
+        return disas
 
     def __iter__(self):
         self.file.seek(HEADER_LENGTH + self.extra_length, 0)
@@ -172,22 +198,22 @@ class TraceData:
     def __next__(self) -> TraceEntry:
         additional_data = []
 
-        if self.uses_multiple_instruction_sets and self.instructions_left_in_block == 0:
-            isa_mode_raw = self.file.read(1)
-            if len(isa_mode_raw) != 1:
+        if self.multiple_triple_and_models and self.instructions_left_in_block == 0:
+            isa_idx_raw = self.file.read(1)
+            if len(isa_idx_raw) != 1:
                 # No more data frames to read
                 raise StopIteration
 
-            self.isa_mode = isa_mode_raw[0]
+            self.update_triple_and_model(isa_idx_raw[0])
             
             block_length_raw = self.file.read(8)
             if len(block_length_raw) != 8:
                 raise InvalidFileFormatException("Unexpected end of file")
             
             # The `instructions_left_in_block` counter is kept only for traces produced by cores that can switch between multiple modes.
-            self.instructions_left_in_block = int.from_bytes(block_length_raw, byteorder="little", signed=False)
+            self.instructions_left_in_block = int.from_bytes(block_length_raw, byteorder=BYTE_ORDER, signed=False)
 
-        if self.uses_multiple_instruction_sets:
+        if self.multiple_triple_and_models:
             self.instructions_left_in_block -= 1
 
         pc = self.file.read(self.pc_length)
@@ -219,12 +245,14 @@ class TraceData:
                 additional_data.append(self.parse_riscv_vector_configuration_data())
             elif additional_data_type is AdditionalDataType.RiscVAtomicInstruction:
                 additional_data.append(self.parse_riscv_atomic_instruction_data())
+            elif additional_data_type is AdditionalDataType.Registers:
+                additional_data.append(self.parse_registers_data())
 
             try:
                 additional_data_type = AdditionalDataType(self.file.read(1)[0])
             except IndexError:
                 break
-        return TraceEntry(pc, opcode, additional_data, self.isa_mode)
+        return TraceEntry(pc, opcode, additional_data, self.active_triple_and_model)
 
     def parse_memory_access_data(self) -> str:
         data = self.file.read(MEMORY_ACCESS_LENGTH)
@@ -284,14 +312,54 @@ class TraceData:
         prePostText = "after" if is_after_execution else "before"
         return f"AMO operands {prePostText} - RD: {rd}, RS1: {rs1} (memory value: {memory_value}), RS2: {rs2}"
 
+    def parse_registers_data(self) -> str:
+        text = ""
+        registers_data = []
+        try:
+            pre_opcode = bool.from_bytes(self.file.read(1), byteorder = BYTE_ORDER)
+            if pre_opcode:
+                text = " Pre: "
+            else:
+                text = "Post: "
+
+            registers_count = int.from_bytes(self.file.read(1), byteorder = BYTE_ORDER)
+            if registers_count == 0:
+                raise ValueError("can't read registers number")
+
+            for r in range(0, registers_count):
+                register_name_size = int.from_bytes(self.file.read(1), byteorder = BYTE_ORDER)
+                if register_name_size == 0:
+                    raise ValueError("register name size is 0")
+
+                try:
+                    register_name = self.file.read(register_name_size).decode("utf-8")
+                except UnicodeError:
+                    raise InvalidFileFormatException("can't decode register name")
+
+                width = int.from_bytes(self.file.read(1), byteorder = BYTE_ORDER)
+                if width == 0:
+                    raise ValueError("register size is 0")
+
+                value = self.file.read(width)
+                if (len(value) != width):
+                    raise ValueError("can't read register data")
+
+                registers_data.append(f"{register_name}: {bytes_to_hex(value, zero_padded=False)}")
+
+        except Exception as e:
+            raise InvalidFileFormatException("Invalid registers data, " + str(e))
+
+        return text + " | ".join(registers_data)
+
     def format_entry(self, entry: TraceEntry) -> str:
-        (pc, opcode, additional_data, isa_mode) = entry
+        (pc, opcode, additional_data, triple_and_model) = entry
         pc_str: str = ""
         opcode_str: str = ""
         if self.pc_length:
             pc_str = bytes_to_hex(pc)
         if self.has_opcodes:
-            opcode_str = bytes_to_hex(opcode)
+            is_thumb = triple_and_model.startswith("thumb")
+            opcode_str = bytes_to_thumb_hex(opcode) if is_thumb else bytes_to_hex(opcode)
         output = ""
         if self.pc_length and self.has_opcodes:
             output = f"{pc_str}: {opcode_str}"
@@ -303,9 +371,7 @@ class TraceData:
             output = ""
 
         if self.has_opcodes and self.disassemble:
-            if not self.disassemblers:
-                raise RuntimeError("No disassembly library loaded")
-            disas = self.disassemblers[isa_mode]
+            disas = self.get_disas(triple_and_model)
             _, instruction = disas.get_instruction(opcode)
             output += " " + instruction.decode("utf-8")
 
@@ -330,7 +396,7 @@ class LLVMDisassembler():
 
         self._context = self.lib.llvm_create_disasm_cpu(c_char_p(triple.encode('utf-8')), c_char_p(cpu.encode('utf-8')))
         if not self._context:
-            raise RuntimeError('CPU or triple name not detected by LLVM. Disassembling will not be possible.')
+            raise RuntimeError(f'Triple {triple} on CPU {cpu} not detected by LLVM. Disassembling will not be possible.')
 
     def __del__(self):
         if  hasattr(self, '_context'):
@@ -357,11 +423,19 @@ class LLVMDisassembler():
         return (bytes_read, disas_str.value)
 
 def handle_coverage(args, trace_data_per_file) -> None:
+    if args.coverage_binary_url:
+        fpath, _ = urllib.request.urlretrieve(args.coverage_binary_url)
+        elf_file_handle = open(fpath, "rb")
+    else:
+        elf_file_handle = args.coverage_binary
+
     coverage_config = coverage.Coverage(
-        elf_file_handler=args.coverage_binary,
+        elf_file_handler=elf_file_handle,
         pc2line_file_stream=args.pc2line_file,
         code_filenames=args.coverage_code,
         substitute_paths=args.sub_source_path,
+        ignore_paths=args.ignore_paths,
+        test_name=args.test_name,
         debug=args.debug,
         print_unmatched_address=args.print_unmatched_address,
         lazy_line_cache=args.lazy_line_cache,
@@ -399,41 +473,54 @@ def handle_coverage(args, trace_data_per_file) -> None:
         for line in printed_report:
             print(line)
 
+    if args.coverage_binary_url:
+        elf_file_handle.close()
+        urllib.request.urlcleanup()
+
 
 def find_llvm_disas() -> str:
-    p = platform.system()
-    if p == 'Darwin':
-        ext = '.dylib'
-    elif p == 'Windows':
-        ext = '.dll'
+    uname = platform.uname()
+
+    if uname.system == 'Darwin':
+        rid = "osx"
+        ext = "dylib"
+    elif uname.system == 'Windows':
+        rid = "win"
+        ext = "dll"
     else:
-        ext = '.so'
+        rid = "linux"
+        ext = "so"
 
-    # In portable packages, the name does not contain 'aarch64', so handle both cases, trying the
-    # aarch64 version first.
-    lib_names = ['libllvm-disas' + ext]
+    if uname.machine.lower() in ('arm64', 'aarch64'):
+        rid += "-arm64"
+        lib_suffix = "-aarch64"
+    else:
+        rid += "-x64"
+        lib_suffix = ""
 
-    if platform.uname().machine.lower() in ('arm64', 'aarch64'):
-        lib_names.insert(0, 'libllvm-disas-aarch64' + ext)
+    lib_subpaths = [
+        os.path.join(rid, "libllvm-disas.so"), # platform-lib format
+        f"libllvm-disas{lib_suffix}.{ext}" # renode-resources format
+    ]
 
     lib_search_paths = [
         os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, os.pardir, os.pardir, "lib", "resources", "llvm"),
-        os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, os.pardir, os.pardir, "bin"),
-        os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, os.pardir, os.pardir),
+        os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, os.pardir, os.pardir, "bin", "platform-lib"),
+        os.path.join(os.path.dirname(os.path.realpath(__file__)), os.pardir, os.pardir, os.pardir, "platform-lib"),
         os.path.dirname(os.path.realpath(__file__)), 
         os.getcwd()
     ]
 
     llvm_disas_path = None
 
-    for search_path, lib_name in itertools.product(lib_search_paths, lib_names):
-        lib_path = os.path.join(search_path, lib_name)
+    for search_path, subpath in itertools.product(lib_search_paths, lib_subpaths):
+        lib_path = os.path.join(search_path, subpath)
         if os.path.isfile(lib_path):
             llvm_disas_path = lib_path
             break
 
     if llvm_disas_path is None:
-        raise FileNotFoundError('Could not find ' + " or ".join(lib_names) + ' in any of the following locations: ' + ', '.join([os.path.abspath(path) for path in lib_search_paths]))
+        raise FileNotFoundError('Could not find libllvm-disas in any of the following locations: ' + ', '.join([os.path.join(path.abspath(ppath), rid) for ppath in lib_search_paths]))
     
     return llvm_disas_path
 
@@ -456,14 +543,17 @@ def main():
 
     source_map_parser = cov_parser.add_mutually_exclusive_group(required=True)
     source_map_parser.add_argument("--binary", dest='coverage_binary', default=None, type=argparse.FileType('rb'), help="path to an ELF file with DWARF data")
+    source_map_parser.add_argument("--binary-url", dest='coverage_binary_url', default=None, type=str, help="Network address to an ELF file with DWARF data")
     source_map_parser.add_argument("--pc2line", dest='pc2line_file', default=None, type=argparse.FileType('r'), help="path to a file containing PC to line number mappings")
     cov_parser.add_argument("--sources", dest='coverage_code', default=None, nargs='+', type=str, help="path to a (list of) source file(s)")
     cov_parser.add_argument("--output", dest='coverage_output', default=None, type=str, help="path to the output coverage file")
+    cov_parser.add_argument("--name", dest='test_name', default="", type=str, help="Provide test name")
     cov_parser.add_argument("--legacy", default=False, action="store_true", help="Output data in a legacy text-based format")
     cov_parser.add_argument("--export-for-coverview", default=False, action="store_true", help="Pack data to a format compatible with the Coverview project (https://github.com/antmicro/coverview)")
     cov_parser.add_argument("--coverview-config", default=None, type=str, help="Provide parameters for Coverview integration configuration JSON")
     cov_parser.add_argument("--print-unmatched-address", default=False, action="store_true", help="Print addresses not matched to any source lines")
     cov_parser.add_argument("--sub-source-path", default=[], nargs='*', action='extend', type=coverage.PathSubstitution.from_arg, help="Substitute a part of sources' path. Format is: old_path:new_path")
+    cov_parser.add_argument("--ignore-paths", default=[], nargs='*', action='extend', help='Ignore source files matching pattern(s)')
     cov_parser.add_argument("--lazy-line-cache", default=False, action="store_true", help="Disable line to address eager cache generation. For big programs, reduce memory usage, but process traces much slower")
     cov_parser.add_argument("--no-shorten-paths", default=False, action="store_true", help="Disable removing common path prefix from coverage output. Only relevant with '--export-for-coverview'")
     cov_parser.add_argument("--tests-as-total", default=False, action="store_true", help="Show executed tests out of total tests in line coverage in coverview. Only relevant with '--export-for-coverview'")
@@ -510,6 +600,8 @@ def main():
         sys.exit(f"Error during execution: {err}")
     except (FileNotFoundError, InvalidFileFormatException) as err:
         sys.exit(f"Error while loading file: {err}")
+    except (urllib.error.URLError, urllib.error.HTTPError) as err:
+        sys.exit(f"Error while fetching file: {err}")
     except KeyboardInterrupt:
         sys.exit(1)
 

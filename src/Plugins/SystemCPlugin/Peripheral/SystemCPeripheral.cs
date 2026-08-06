@@ -1,220 +1,32 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Linq;
+using System.Threading;
+
 using Antmicro.Renode.Core;
-using Antmicro.Renode.Exceptions;
+using Antmicro.Renode.Debugging;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
 using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
-using Antmicro.Renode.Utilities;
 
-using System;
-using System.Collections.Generic;
-using System.Collections.ObjectModel;
-using System.Diagnostics;
-using System.Linq;
-using System.Net;
-using System.Net.Sockets;
-using System.Runtime.InteropServices;
-using System.Text;
-using System.Threading;
-
-#if !PLATFORM_WINDOWS
-using Mono.Unix.Native;
-#endif
+using Range = Antmicro.Renode.Core.Range;
 
 namespace Antmicro.Renode.Peripherals.SystemC
 {
-    public enum RenodeAction : byte
-    {
-        Init = 0,
-        Read = 1,
-        Write = 2,
-        Timesync = 3,
-        GPIOWrite = 4,
-        Reset = 5,
-        DMIReq = 6,
-        InvalidateTBs = 7,
-        ReadRegister = 8,
-        WriteRegister = 9,
-    }
-
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    public struct RenodeMessage
-    {
-        public RenodeMessage(RenodeAction actionId, byte dataLength, byte connectionIndex, ulong address, ulong payload)
-        {
-            ActionId = actionId;
-            DataLength = dataLength;
-            ConnectionIndex = connectionIndex;
-            Address = address;
-            Payload = payload;
-        }
-
-        public byte[] Serialize()
-        {
-            var size = Marshal.SizeOf(this);
-            var result = new byte[size];
-            var handler = default(GCHandle);
-
-            try
-            {
-                handler = GCHandle.Alloc(result, GCHandleType.Pinned);
-                Marshal.StructureToPtr(this, handler.AddrOfPinnedObject(), false);
-            }
-            finally
-            {
-                if(handler.IsAllocated)
-                {
-                    handler.Free();
-                }
-            }
-
-            return result;
-        }
-
-        public void Deserialize(byte[] message)
-        {
-            var handler = default(GCHandle);
-            try
-            {
-                handler = GCHandle.Alloc(message, GCHandleType.Pinned);
-                this = (RenodeMessage)Marshal.PtrToStructure(handler.AddrOfPinnedObject(), typeof(RenodeMessage));
-            }
-            finally
-            {
-                if(handler.IsAllocated)
-                {
-                    handler.Free();
-                }
-            }
-        }
-
-        public override string ToString()
-        {
-            return $"RenodeMessage [{ActionId}@{ConnectionIndex}:{Address}] {Payload}";
-        }
-
-        public bool IsSystemBusConnection() => ConnectionIndex == MainSystemBusConnectionIndex;
-
-        public bool IsDirectConnection() => !IsSystemBusConnection();
-
-        public byte GetDirectConnectionIndex()
-        {
-            if(!IsDirectConnection())
-            {
-                Logger.Log(LogLevel.Error, "Message for main system bus connection does not have a direct connection index.");
-                return 0xff;
-            }
-            return (byte)(ConnectionIndex - 1);
-        }
-
-        public const int DMIAllowed = 1;
-        public const int DMINotAllowed = 0;
-
-        private const byte MainSystemBusConnectionIndex = 0;
-
-        public readonly RenodeAction ActionId;
-        public readonly byte DataLength;
-        public readonly byte ConnectionIndex;
-        public readonly ulong Address;
-        public readonly ulong Payload;
-    }
-
-    [StructLayout(LayoutKind.Sequential, Pack = 1)]
-    public struct DMIMessage
-    {
-        public DMIMessage(RenodeAction actionId, byte allowed, ulong startAddress, ulong endAddress, ulong mmfOffset, string mmfPath)
-        {
-            ActionId = actionId;
-            Allowed = allowed;
-            StartAddress = startAddress;
-            EndAddress = endAddress;
-            MMFOffset = mmfOffset;
-            MMFPath = new byte[256];
-            byte[] mmfPathBytes = Encoding.ASCII.GetBytes(mmfPath);
-            if(mmfPathBytes.Length > 256)
-            {
-                Logger.Log(LogLevel.Error, "MMF path name is too long");
-            }
-            else
-            {
-                Array.Copy(mmfPathBytes, MMFPath, Math.Min(mmfPathBytes.Length, MMFPath.Length));
-            }
-        }
-
-        public byte[] Serialize()
-        {
-            var size = Marshal.SizeOf(this);
-            var result = new byte[size];
-            var handler = default(GCHandle);
-
-            try
-            {
-                handler = GCHandle.Alloc(result, GCHandleType.Pinned);
-                Marshal.StructureToPtr(this, handler.AddrOfPinnedObject(), false);
-            }
-            finally
-            {
-                if(handler.IsAllocated)
-                {
-                    handler.Free();
-                }
-            }
-
-            return result;
-        }
-
-        public void Deserialize(byte[] message)
-        {
-            var handler = default(GCHandle);
-            try
-            {
-                handler = GCHandle.Alloc(message, GCHandleType.Pinned);
-                this = (DMIMessage)Marshal.PtrToStructure(handler.AddrOfPinnedObject(), typeof(DMIMessage));
-            }
-            finally
-            {
-                if(handler.IsAllocated)
-                {
-                    handler.Free();
-                }
-            }
-        }
-
-        public override string ToString()
-        {
-            return $"DMIMessage [{ActionId}@{StartAddress}:{EndAddress}]";
-        }
-
-        public readonly RenodeAction ActionId;
-        public readonly byte Allowed;
-        public readonly ulong StartAddress;
-        public readonly ulong EndAddress;
-        public readonly ulong MMFOffset;
-
-        // TODO: 256 should be a named constant
-        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 256)]
-        public byte[] MMFPath;
-    }
-
-    public interface IDirectAccessPeripheral : IPeripheral
-    {
-        ulong ReadDirect(byte dataLength, long offset, byte connectionIndex);
-
-        void WriteDirect(byte dataLength, long offset, ulong value, byte connectionIndex);
-    };
-
-    public class SystemCPeripheral : IQuadWordPeripheral, IDoubleWordPeripheral, IWordPeripheral, IBytePeripheral, INumberedGPIOOutput, IGPIOReceiver, IDirectAccessPeripheral, IDisposable
+    public unsafe partial class SystemCPeripheral : IQuadWordPeripheral, IDoubleWordPeripheral, IWordPeripheral, IBytePeripheral, INumberedGPIOOutput, IGPIOReceiver, IDirectAccessPeripheral
     {
         public SystemCPeripheral(
                 IMachine machine,
-                string address,
+                string address = "127.0.0.1",
                 int port = 0,
                 int timeSyncPeriodUS = 1000,
                 bool disableTimeoutCheck = false
@@ -243,6 +55,13 @@ namespace Antmicro.Renode.Peripherals.SystemC
                 innerConnections[i] = new GPIO();
             }
             Connections = new ReadOnlyDictionary<int, IGPIO>(innerConnections);
+
+            // Timer unit is microseconds
+            var timerName = "RenodeSystemCTimesyncTimer";
+            var timesyncFrequency = 1000000UL;
+            var timesyncLimit = (ulong)timeSyncPeriodUS;
+
+            timesyncTimer = new LimitTimer(machine.ClockSource, timesyncFrequency, this, timerName, limit: timesyncLimit, enabled: false, eventEnabled: true, autoUpdate: true);
         }
 
         public ulong ReadQuadWord(long offset)
@@ -252,32 +71,11 @@ namespace Antmicro.Renode.Peripherals.SystemC
 
         public void WriteRegister(byte dataLength, long offset, ulong value, byte connectionIndex = 0)
         {
-            WriteInternal(RenodeAction.WriteRegister, dataLength, offset, value, connectionIndex);
-        }
-
-        public void Dispose()
-        {
-            if(systemcProcess != null && !systemcProcess.HasExited)
-            {
-                // Init message sent after connection has been established signifies Renode terminated and SystemC process
-                // should exit.
-                var request = new RenodeMessage(RenodeAction.Init, 0, 0, 0, 0);
-                SendRequest(request, out var response);
-
-                if(!systemcProcess.WaitForExit(500))
-                {
-                    this.Log(LogLevel.Info, "SystemC process failed to exit gracefully - killing it.");
-                    systemcProcess.Kill();
-                }
-            }
-
-            forwardSocket?.Close();
-            backwardSocket?.Close();
+            WriteInternal(RenodeAction.WriteRegister, dataLength, offset, value, connectionIndex, out _);
         }
 
         public void Reset()
         {
-            outGPIOState = 0;
             var request = new RenodeMessage(RenodeAction.Reset, 0, 0, 0, 0);
             SendRequest(request, out var response);
         }
@@ -285,31 +83,38 @@ namespace Antmicro.Renode.Peripherals.SystemC
         public void OnGPIO(int number, bool value)
         {
             // When GPIO connections are initialized, OnGPIO is called with
-            // false value. The socket is not yet initialized in that case. We
+            // false value. The transport is not yet initialized in that case. We
             // can safely return, no special initialization is required.
-            if(forwardSocket == null)
+            if(!connectionActive)
             {
                 return;
             }
+            this.NoisyLog("Renode-triggered GPIO {0}, value {1}", number, value);
 
-            BitHelper.SetBit(ref outGPIOState, (byte)number, value);
-            var request = new RenodeMessage(RenodeAction.GPIOWrite, 0, 0, 0, outGPIOState);
-            SendRequest(request, out var response);
+            var payload = value ? 1UL : 0UL;
+            var request = new RenodeMessage(RenodeAction.GPIOWrite, 0, 0, (ulong)number, payload);
+            RenodeMessage response;
+
+            if(TrySendSidebandRequest(request, out response))
+            {
+                return;
+            }
+            SendRequest(request, out response);
         }
 
         public void WriteDirect(byte dataLength, long offset, ulong value, byte connectionIndex)
         {
-            Write(dataLength, offset, value, connectionIndex);
+            Write(dataLength, offset, value, connectionIndex, skipDmi: true);
         }
 
         public ulong ReadDirect(byte dataLength, long offset, byte connectionIndex)
         {
-            return Read(dataLength, offset, connectionIndex);
+            return Read(dataLength, offset, connectionIndex, skipDmi: true);
         }
 
         public ulong ReadRegister(byte dataLength, long offset, byte connectionIndex = 0)
         {
-            return ReadInternal(RenodeAction.ReadRegister, dataLength, offset, connectionIndex);
+            return ReadInternal(RenodeAction.ReadRegister, dataLength, offset, connectionIndex, out _);
         }
 
         public byte ReadByte(long offset)
@@ -358,65 +163,190 @@ namespace Antmicro.Renode.Peripherals.SystemC
             directAccessPeripherals.Add(connectionIndex, target);
         }
 
-        public string SystemCExecutablePath
+        public IReadOnlyDictionary<int, IGPIO> Connections { get; }
+
+        public bool DisableNativeDmi
         {
-            get => systemcExecutablePath;
+            get => disableNativeDmi;
             set
             {
-                try
+                if(disableNativeDmi == value)
                 {
-                    systemcExecutablePath = value;
-                    var listenerSocket = CreateListenerSocket(requestedPort);
-                    var assignedPort = ((IPEndPoint)listenerSocket.LocalEndPoint).Port;
-                    this.Log(LogLevel.Info, "SystemCPeripheral waiting for forward SystemC connection on {0}:{1}", address, assignedPort);
-                    var connectionParams = $"{address} {assignedPort}";
-                    StartSystemCProcess(systemcExecutablePath, connectionParams);
-                    SetupConnection(listenerSocket);
-                    SetupTimesync();
+                    return;
                 }
-                catch(Exception e)
+                disableNativeDmi = value;
+                if(!value)
                 {
-                    throw new RecoverableException($"Failed to start SystemC process: {e.Message}");
+                    // Nothing to do on DMI disabled -> enabled transition.
+                    return;
                 }
+                InvalidateDmiRegion(0, ulong.MaxValue);
             }
         }
 
-        public IReadOnlyDictionary<int, IGPIO> Connections { get; }
+        public bool DisableSidebandChannel { get; set; }
 
-        private ulong Read(byte dataLength, long offset, byte connectionIndex = 0)
+        public bool DisableDebugAccess { get; set; }
+
+        protected readonly IMachine machine;
+
+        private static BusAccessError TlmStatusErrorToBusAccessError(TlmStatus tlmStatus)
         {
-            return ReadInternal(RenodeAction.Read, dataLength, offset, connectionIndex);
+            switch(tlmStatus)
+            {
+            case TlmStatus.Ok:
+                throw new ArgumentException("TLM ok is not an error");
+            case TlmStatus.Incomplete:
+                throw new ArgumentException("Incomplete TLM transaction");
+            case TlmStatus.GenericError:
+                return BusAccessError.GenericError;
+            case TlmStatus.AddressError:
+                return BusAccessError.AddressError;
+            case TlmStatus.CommandError:
+                return BusAccessError.CommandError;
+            case TlmStatus.BurstError:
+                return BusAccessError.BurstError;
+            case TlmStatus.ByteEnableError:
+                return BusAccessError.ByteEnableError;
+            default:
+                throw new ArgumentException("Unexpected TLM status");
+            }
         }
 
-        private ulong ReadInternal(RenodeAction action, byte dataLength, long offset, byte connectionIndex)
+        private ulong Read(byte dataLength, long offset, byte connectionIndex = 0, bool skipDmi = false)
         {
-            var request = new RenodeMessage(action, dataLength, connectionIndex, (ulong)offset, 0);
-            if(!SendRequest(request, out var response))
+            var value = ReadInternal(RenodeAction.Read, dataLength, offset, connectionIndex, out var dmiAllowed);
+            if(!skipDmi && dmiAllowed)
+            {
+                TryMapDmiRegion((ulong)offset);
+            }
+            return value;
+        }
+
+        private ulong ReadInternal(RenodeAction action, byte dataLength, long offset, byte connectionIndex, out bool dmiAllowed)
+        {
+            dmiAllowed = false;
+            DebugHelper.Assert(dataLength <= 8);
+            var extensionFields = GetExtensionFields(out _, out _);
+            var dataLengthWithExtensionFields = (byte)(extensionFields | dataLength);
+            var onCpuThread = sysbus.TryGetCurrentCPU(out var cpu) && cpu.OnPossessedThread;
+            if(!DisableDebugAccess && !onCpuThread)
+            {
+                action = RenodeAction.ReadDebug;
+            }
+            var request = new RenodeMessage(action, dataLengthWithExtensionFields, connectionIndex, (ulong)offset, 0);
+            RenodeMessage response;
+
+            if(!DisableDebugAccess && TrySendSidebandRequest(request, out response))
+            {
+                return response.Payload;
+            }
+
+            if(!SendRequest(request, out response))
             {
                 this.Log(LogLevel.Error, "Request to SystemCPeripheral failed, Read will return 0.");
                 return 0;
             }
 
-            TryToSkipTransactionTime(response.Address);
+            // Debug transaction doesn't return status in response, so assume ok.
+            var status = TlmStatus.Ok;
+            if(action != RenodeAction.ReadDebug)
+            {
+                status = (TlmStatus)response.DataLength;
+                if(status != TlmStatus.Ok)
+                {
+                    this.WarningLog("Read transaction of width {0} to offset 0x{1:X} failed with status: {2}", dataLength, offset, status);
+                }
+            }
 
+            if(onCpuThread)
+            {
+                if(status != TlmStatus.Ok)
+                {
+                    throw new BusAccessException(TlmStatusErrorToBusAccessError(status));
+                }
+
+                TryToSkipTransactionTime(response.Address);
+                dmiAllowed = response.ConnectionIndex == DmiSupported;
+            }
             return response.Payload;
         }
 
-        private void Write(byte dataLength, long offset, ulong value, byte connectionIndex = 0)
+        private void Write(byte dataLength, long offset, ulong value, byte connectionIndex = 0, bool skipDmi = false)
         {
-            WriteInternal(RenodeAction.Write, dataLength, offset, value, connectionIndex);
+            WriteInternal(RenodeAction.Write, dataLength, offset, value, connectionIndex, out var dmiAllowed);
+            if(!skipDmi && dmiAllowed)
+            {
+                TryMapDmiRegion((ulong)offset);
+            }
         }
 
-        private void WriteInternal(RenodeAction action, byte dataLength, long offset, ulong value, byte connectionIndex)
+        private void WriteInternal(RenodeAction action, byte dataLength, long offset, ulong value, byte connectionIndex, out bool dmiAllowed)
         {
-            var request = new RenodeMessage(action, dataLength, connectionIndex, (ulong)offset, value);
-            if(!SendRequest(request, out var response))
+            dmiAllowed = false;
+            DebugHelper.Assert(dataLength <= 8);
+            var extensionFields = GetExtensionFields(out _, out _);
+            var dataLengthWithExtensionFields = (byte)(extensionFields | dataLength);
+            var onCpuThread = sysbus.TryGetCurrentCPU(out var cpu) && cpu.OnPossessedThread;
+            if(!DisableDebugAccess && !onCpuThread)
+            {
+                action = RenodeAction.WriteDebug;
+            }
+            var request = new RenodeMessage(action, dataLengthWithExtensionFields, connectionIndex, (ulong)offset, value);
+            RenodeMessage response;
+
+            if(!DisableDebugAccess && TrySendSidebandRequest(request, out response))
+            {
+                return;
+            }
+
+            if(!SendRequest(request, out response))
             {
                 this.Log(LogLevel.Error, "Request to SystemCPeripheral failed, Write will have no effect.");
                 return;
             }
 
-            TryToSkipTransactionTime(response.Address);
+            // Debug transaction doesn't return status in response, so assume ok.
+            var status = TlmStatus.Ok;
+            if(action != RenodeAction.WriteDebug)
+            {
+                status = (TlmStatus)response.DataLength;
+                if(status != TlmStatus.Ok)
+                {
+                    this.WarningLog("Write transaction of width {0} to offset 0x{1:X} failed with status: {2}", dataLength, offset, status);
+                }
+            }
+
+            if(onCpuThread)
+            {
+                if(status != TlmStatus.Ok)
+                {
+                    throw new BusAccessException(TlmStatusErrorToBusAccessError(status));
+                }
+
+                TryToSkipTransactionTime(response.Address);
+                dmiAllowed = response.ConnectionIndex == DmiSupported;
+            }
+        }
+
+        private bool TrySendSidebandRequest(RenodeMessage request, out RenodeMessage response)
+        {
+            response = new RenodeMessage();
+
+            if(DisableSidebandChannel)
+            {
+                return false;
+            }
+
+            if(!sysbus.TryGetCurrentCPU(out var cpu) || !cpu.OnPossessedThread)
+            {
+                if(SendSidebandRequest(request, out response))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private ulong GetCurrentVirtualTimeUS()
@@ -425,146 +355,65 @@ namespace Antmicro.Renode.Peripherals.SystemC
             return (ulong)machine.LocalTimeSource.ElapsedVirtualTime.TotalMicroseconds;
         }
 
-        private void StartSystemCProcess(string systemcExecutablePath, string connectionParams)
-        {
-            try
-            {
-#if !PLATFORM_WINDOWS
-                Mono.Unix.Native.Syscall.chmod(systemcExecutablePath, FilePermissions.S_IRWXU);
-#endif
-                systemcProcess = new Process
-                {
-                    StartInfo = new ProcessStartInfo(systemcExecutablePath)
-                    {
-                        UseShellExecute = false,
-                        Arguments = connectionParams
-                    }
-                };
-
-                systemcProcess.Start();
-            }
-            catch(Exception e)
-            {
-                throw new RecoverableException(e.Message);
-            }
-        }
-
-        private Socket CreateListenerSocket(int requestedPort)
-        {
-            var listenerSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            listenerSocket.Bind(new IPEndPoint(IPAddress.Parse(address), requestedPort));
-            listenerSocket.Listen(2);
-            return listenerSocket;
-        }
-
-        private void SetupConnection(Socket listenerSocket)
-        {
-            forwardSocket = listenerSocket.Accept();
-            forwardSocket.SendTimeout = 1000;
-            // No ReceiveTimeout for forwardSocket if the disableTimeoutCheck constructor argument is set - so if a debugger halts the SystemC process, Renode will wait for the process to restart
-            if(!disableTimeoutCheck)
-            {
-                forwardSocket.ReceiveTimeout = 1000;
-            }
-
-            backwardSocket = listenerSocket.Accept();
-            backwardSocket.SendTimeout = 1000;
-            // No ReceiveTimeout for backwardSocket - it runs on a dedicated thread and by design blocks on Receive until a message arrives from SystemC process.
-
-            listenerSocket.Close();
-
-            SendRequest(new RenodeMessage(RenodeAction.Init, 0, 0, 0, (ulong)timeSyncPeriodUS), out var response);
-
-            backwardThread.Start();
-        }
-
         private void SetupTimesync()
         {
-            // Timer unit is microseconds
-            var timerName = "RenodeSystemCTimesyncTimer";
-            var timesyncFrequency = 1000000;
-            var timesyncLimit = (ulong)timeSyncPeriodUS;
-
-            var timesyncTimer = new LimitTimer(machine.ClockSource, timesyncFrequency, this, timerName, limit: timesyncLimit, enabled: true, eventEnabled: true, autoUpdate: true);
-
-            Action<TimeInterval, TimeInterval> adjustTimesyncToQuantum = ((_, newQuantum) =>
-            {
-                if(TimeInterval.FromMicroseconds(timesyncTimer.Limit) < newQuantum)
-                {
-                    var newLimit = (ulong)newQuantum.TotalMicroseconds;
-                    this.Log(LogLevel.Warning, $"Requested time synchronization period of {timesyncTimer.Limit}us is smaller than local time source quantum - synchronization time will be changed to {newLimit}us to match it.");
-                    timesyncTimer.Limit = newLimit;
-                }
-            });
+            timesyncTimer.Enabled = true;
             var currentQuantum = machine.LocalTimeSource.Quantum;
-            adjustTimesyncToQuantum(currentQuantum, currentQuantum);
-            machine.LocalTimeSource.QuantumChanged += adjustTimesyncToQuantum;
-
-            timesyncTimer.LimitReached += () =>
-            {
-                machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
-                {
-                    var request = new RenodeMessage(RenodeAction.Timesync, 0, 0, 0, GetCurrentVirtualTimeUS());
-                    SendRequest(request, out var response);
-                });
-            };
+            AdjustTimesyncToQuantum(currentQuantum, currentQuantum);
+            machine.LocalTimeSource.QuantumChanged += AdjustTimesyncToQuantum;
+            timesyncTimer.LimitReached += OnTimesyncTimerLimitReached;
         }
 
-        private bool SendRequest(RenodeMessage request, out RenodeMessage responseMessage)
+        private void TeardownTimesync()
         {
-            lock(messageLock)
+            machine.LocalTimeSource.QuantumChanged -= AdjustTimesyncToQuantum;
+            timesyncTimer.LimitReached -= OnTimesyncTimerLimitReached;
+            timesyncTimer.Reset();
+        }
+
+        private void AdjustTimesyncToQuantum(TimeInterval oldQuantum, TimeInterval newQuantum)
+        {
+            if(TimeInterval.FromMicroseconds(timesyncTimer.Limit) < newQuantum)
             {
-                var messageSize = Marshal.SizeOf(typeof(RenodeMessage));
-                var recvBytes = new byte[messageSize];
-                if(forwardSocket != null)
-                {
-                    forwardSocket.Send(request.Serialize(), SocketFlags.None);
-                    forwardSocket.Receive(recvBytes, 0, messageSize, SocketFlags.None);
-
-                    responseMessage = new RenodeMessage();
-                    responseMessage.Deserialize(recvBytes);
-
-                    return true;
-                }
-                else
-                {
-                    this.Log(LogLevel.Error, "Unable to communicate with SystemC peripheral. Try setting SystemCExecutablePath first.");
-                    responseMessage = new RenodeMessage();
-                    return false;
-                }
+                var newLimit = (ulong)newQuantum.TotalMicroseconds;
+                this.Log(LogLevel.Warning, $"Requested time synchronization period of {timesyncTimer.Limit}us is smaller than local time source quantum - synchronization time will be changed to {newLimit}us to match it.");
+                timesyncTimer.Limit = newLimit;
             }
         }
 
+        private void OnTimesyncTimerLimitReached()
+        {
+            machine.LocalTimeSource.ExecuteInNearestSyncedState(_ =>
+            {
+                var request = new RenodeMessage(RenodeAction.Timesync, 0, 0, 0, GetCurrentVirtualTimeUS());
+                SendRequest(request, out var response);
+            });
+        }
+
+        // NOTE: Don't send anything via the `forwardSocket` from the background connection thread.
+        //       This may lead to deadlocks, as SystemC blocks waiting for a response from this thread.
         private void BackwardConnectionLoop()
         {
             while(true)
             {
-                var messageSize = Marshal.SizeOf(typeof(RenodeMessage));
-                var recvBytes = new byte[messageSize];
-
-                var nbytes = backwardSocket.Receive(recvBytes, 0, messageSize, SocketFlags.None);
-                if(nbytes == 0)
+                if(!ReceiveBackwardRequest(out var message))
                 {
-                    this.Log(LogLevel.Info, "Backward connection to SystemC process closed.");
                     return;
                 }
 
-                var message = new RenodeMessage();
-                message.Deserialize(recvBytes);
-
-                ulong payload = 0;
                 switch(message.ActionId)
                 {
+                case RenodeAction.Init:
+                    SetupTimesync();
+                    var timesyncResponse = new RenodeMessage(RenodeAction.Init, 0, 0, 0, (ulong)timeSyncPeriodUS);
+                    SendBackwardResponse(timesyncResponse);
+                    break;
                 case RenodeAction.GPIOWrite:
-                    // We have to respond before GPIO state is changed, because SystemC is blocked until
-                    // it receives the response. Setting the GPIO may require it to respond, e. g. when it
-                    // is interracted with from an interrupt handler.
-                    backwardSocket.Send(message.Serialize(), SocketFlags.None);
-                    for(int pin = 0; pin < NumberOfGPIOPins; pin++)
-                    {
-                        bool irqval = (message.Payload & (1UL << pin)) != 0;
-                        Connections[pin].Set(irqval);
-                    }
+                    var gpioNumber = (int)message.Address;
+                    var isSet = message.Payload == 1;
+                    Connections[gpioNumber].Set(isSet);
+                    SendBackwardResponse(message);
+                    this.NoisyLog("SystemC-triggered GPIO {0}, value {1}", gpioNumber, isSet);
                     break;
                 case RenodeAction.Write:
                     bool writeToSharedMem = false;
@@ -602,9 +451,10 @@ namespace Antmicro.Renode.Peripherals.SystemC
                     }
                     var writeResponseMessage = new RenodeMessage(message.ActionId, message.DataLength,
                             writeToSharedMem ? (byte)RenodeMessage.DMIAllowed : (byte)RenodeMessage.DMINotAllowed, message.Address, message.Payload);
-                    backwardSocket.Send(writeResponseMessage.Serialize(), SocketFlags.None);
+                    SendBackwardResponse(writeResponseMessage);
                     break;
                 case RenodeAction.Read:
+                    ulong payload = 0;
                     bool readFromSharedMem = false;
                     if(message.IsSystemBusConnection())
                     {
@@ -640,57 +490,40 @@ namespace Antmicro.Renode.Peripherals.SystemC
                     var readResponseMessage = new RenodeMessage(message.ActionId, message.DataLength,
                             readFromSharedMem ? (byte)RenodeMessage.DMIAllowed : (byte)RenodeMessage.DMINotAllowed, message.Address, payload);
 
-                    backwardSocket.Send(readResponseMessage.Serialize(), SocketFlags.None);
+                    SendBackwardResponse(readResponseMessage);
                     break;
                 case RenodeAction.DMIReq:
-                    bool allowDMI = false;
                     var targetMemory = sysbus.FindMemory(message.Address);
-                    if(targetMemory != null)
+                    var mapping = targetMemory?.GetFileMappingParameters(message.Address);
+                    DMIMessage responseDMIMessage;
+                    if(mapping == null)
                     {
-                        allowDMI = targetMemory.Peripheral.UsingSharedMemory;
-                    }
-                    long memBase = (long)(targetMemory.RegistrationPoint.Range.StartAddress + targetMemory.RegistrationPoint.Offset);
-                    long memOffset = (long)message.Address - memBase;
-                    ulong segmentStart = (ulong)memBase + (ulong)(memOffset - (memOffset % targetMemory.Peripheral.SegmentSize));
-                    int segmentNo = 0;
-                    if(allowDMI)
-                    {
-                        segmentNo = (int)(memOffset / targetMemory.Peripheral.SegmentSize);
-                        allowDMI = segmentNo >= 0 && segmentNo < targetMemory.Peripheral.SegmentCount;
-                    }
-                    if(allowDMI)
-                    {
-                        // DMI allowed
-                        var responseDMIMessage = new DMIMessage(
-                                message.ActionId,
-                                RenodeMessage.DMIAllowed,
-                                segmentStart,
-                                segmentStart + (ulong)targetMemory.Peripheral.SegmentSize - 1UL, // segment end
-                                targetMemory.Peripheral.GetSegmentAlignmentOffset(segmentNo), // offset into the MMF corresponding to the segment start address
-                                targetMemory.Peripheral.GetSegmentPath(segmentNo) // MMF path
-                            );
-                        backwardSocket.Send(responseDMIMessage.Serialize(), SocketFlags.None);
+                        responseDMIMessage = new DMIMessage(
+                            message.ActionId,
+                            RenodeMessage.DMINotAllowed,
+                            new FileMappingParameters(0, 0, 0, "", IntPtr.Zero)
+                        );
                     }
                     else
                     {
-                        // DMI rejected
-                        var responseDMIMessage = new DMIMessage(
-                                message.ActionId,
-                                RenodeMessage.DMINotAllowed,
-                                0UL,
-                                0UL,
-                                0UL,
-                                ""
-                            );
-                        backwardSocket.Send(responseDMIMessage.Serialize(), SocketFlags.None);
+                        responseDMIMessage = new DMIMessage(
+                            message.ActionId,
+                            RenodeMessage.DMIAllowed,
+                            mapping.Value
+                        );
                     }
+                    SendBackwardResponseDmi(responseDMIMessage);
                     break;
                 case RenodeAction.InvalidateTBs:
                     TryToInvalidateTBs(message.Address, message.Payload);
-                    backwardSocket.Send(message.Serialize(), SocketFlags.None);
+                    SendBackwardResponse(message);
+                    break;
+                case RenodeAction.InvalidateDmiRange:
+                    InvalidateDmiRegion(message.Address, message.Payload);
+                    SendBackwardResponse(message);
                     break;
                 default:
-                    this.Log(LogLevel.Error, "SystemC integration error - invalid message type {0} sent through backward connection from the SystemC process.", message.ActionId);
+                    OnUnhandledRenodeMessage(message);
                     break;
                 }
             }
@@ -703,13 +536,17 @@ namespace Antmicro.Renode.Peripherals.SystemC
                 var translationCPU = cpu as TranslationCPU;
                 if(translationCPU != null)
                 {
-                    translationCPU.OrderTranslationBlocksInvalidation(new IntPtr((int)startAddress), new IntPtr((int)endAddress));
+                    translationCPU.OrderTranslationBlocksInvalidation(checked((nint)startAddress), checked((nint)endAddress));
                 }
             }
         }
 
         private void TryToSkipTransactionTime(ulong timeUS)
         {
+            if(timeUS == 0)
+            {
+                return;
+            }
             if(machine.SystemBus.TryGetCurrentCPU(out var icpu))
             {
                 var baseCPU = icpu as BaseCPU;
@@ -724,28 +561,276 @@ namespace Antmicro.Renode.Peripherals.SystemC
             }
         }
 
-        private Socket backwardSocket;
+        /// <summary>
+        /// Corresponds to get_direct_mem_ptr on SystemC side.
+        /// After receiving a native pointer, it attempts to register it for use by TranslationCPU.
+        /// </summary>
+        /// <param name="offset">address in target's address space</param>
+        private void TryMapDmiRegion(ulong offset)
+        {
+            if(disableNativeDmi)
+            {
+                return;
+            }
 
-        private Socket forwardSocket;
+            if(!useNative || !NativeConfigured)
+            {
+                return;
+            }
 
-        private ulong outGPIOState;
-        private Process systemcProcess;
-        private string systemcExecutablePath;
+            if(!sysbus.TryGetCurrentCPU(out var cpu))
+            {
+                return;
+            }
 
+            foreach(var registrationPoint in sysbus.GetRegistrationPoints(this))
+            {
+                if(registrationPoint.Initiator != cpu)
+                {
+                    // Memory is mapped only when SystemC peripheral has a single initiator which is the current cpu.
+                    // Otherwise unmapping memory in multicore machine would be ambigous and we could accidentaly unmap
+                    // memory not owned by SystemC from the other core.
+                    this.WarningLog("Peripheral must have unambiguous cpu initiator to support mapping of DMI region, try registering it for cpu context");
+                    return;
+                }
+            }
+
+            lock(mappedDmiRanges)
+            {
+                if(mappedDmiRanges.ContainsPoint(offset))
+                {
+                    return;
+                }
+            }
+
+            // RenodeMessage.dataLength field for DMIReq indicates the kind of DMI access being requested.
+            var dataLength = (byte)TlmCommand.Read;
+            DebugHelper.Assert(dataLength <= 8);
+            var extensionFields = GetExtensionFields(out _, out _);
+            var dataLengthWithExtensionFields = (byte)(extensionFields | dataLength);
+            var request = new RenodeMessage(RenodeAction.DMIReq, dataLengthWithExtensionFields, 0, offset, 0);
+            if(!SendDmiRequest(request, out var dmiNativeMessage))
+            {
+                this.ErrorLog("Unable to receive response to DMI request");
+                return;
+            }
+
+            var dmiAccess = dmiNativeMessage.DmiAccess;
+            var startAddress = dmiNativeMessage.StartAddress;
+            var endAddress = dmiNativeMessage.EndAddress;
+            var mappedAddress = checked((nint)dmiNativeMessage.Pointer);
+
+            if(dmiAccess == DmiAccess.None || mappedAddress == IntPtr.Zero || endAddress < startAddress)
+            {
+                return;
+            }
+
+            if(!dmiAccess.HasFlag(DmiAccess.Read))
+            {
+                // The requested access was not granted to the initiator.
+                this.WarningLog("DMI read access wasn't granted to the initiator, memory won't be mapped");
+                return;
+            }
+
+            if(dmiAccess != DmiAccess.ReadWrite)
+            {
+                // The target is allowed to promote Read/Write request to Read+Write.
+                // If it hasn't done so, we can't tell whether it's on purpose
+                // to ensure the other direction goes via blocking transport.
+                // Currently we don't support memory mapping for read or write only,
+                // so to ensure both access types are supported, we issue another DMI request
+                // with the other access type.
+                request = new RenodeMessage(RenodeAction.DMIReq, (byte)TlmCommand.Write, 0, offset, 0);
+                if(!SendDmiRequest(request, out dmiNativeMessage))
+                {
+                    this.ErrorLog("Unable to receive response to DMI request");
+                    return;
+                }
+
+                // At SystemC level, a target wishing to deny read and write access to the DMI region
+                // should set the granted access type to DMI_ACCESS_READ_WRITE, not to DMI_ACCESS_NONE.
+                // The rejection status is returned by get_direct_mem_ptr.
+                // When access is denied, Renode SystemC bridge always sends back DMI_ACCESS_NONE.
+                var dmiAccessWrite = dmiNativeMessage.DmiAccess;
+                var startAddressWrite = dmiNativeMessage.StartAddress;
+                var endAddressWrite = dmiNativeMessage.EndAddress;
+                var mappedAddressWrite = checked((nint)dmiNativeMessage.Pointer);
+
+                if(!dmiAccessWrite.HasFlag(DmiAccess.Write))
+                {
+                    this.WarningLog("DMI write access wasn't granted to the initiator, memory won't be mapped");
+                    return;
+                }
+
+                if(startAddress != startAddressWrite || endAddress != endAddressWrite || mappedAddress != mappedAddressWrite)
+                {
+                    this.WarningLog("Inconsistency between DMI response for read and write access request to address 0x{0:X}, memory won't be mapped", offset);
+                    return;
+                }
+            }
+
+            // Read+Write DMI access was confirmed, proceed to memory mapping.
+            var range = startAddress.To(endAddress);
+            if(!range.Contains(offset))
+            {
+                this.WarningLog("SystemC returned a DMI region {0} that does not contain requested offset 0x{1:X}.", range, offset);
+                return;
+            }
+
+            lock(mappedDmiRanges)
+            {
+                if(mappedDmiRanges.ContainsWholeRange(range))
+                {
+                    return;
+                }
+
+                var rangesToMap = new List<Range> { range };
+                foreach(var existingRange in mappedDmiRanges)
+                {
+                    rangesToMap = rangesToMap.SelectMany(x => x.Subtract(existingRange)).ToList();
+                    if(!rangesToMap.Any())
+                    {
+                        return;
+                    }
+                }
+
+                mappedDmiRanges.Add(range);
+                foreach(var rangeToMap in rangesToMap)
+                {
+                    var pointerOffset = (long)(rangeToMap.StartAddress - startAddress);
+                    var rangeMappedAddress = new IntPtr(mappedAddress + pointerOffset);
+                    sysbus.MapMemory(new DmiMappedSegment(rangeToMap.StartAddress, rangeToMap.Size, rangeMappedAddress), this, context: cpu as ICPUWithMappedMemory);
+                }
+            }
+
+            this.DebugLog("Mapped SystemC DMI region {0}", range);
+        }
+
+        private void InvalidateDmiRegion(ulong startAddress, ulong endAddress)
+        {
+            this.DebugLog("Requested invalidation of SystemC DMI region <0x{0:X}, 0x{1:X}>", startAddress, endAddress);
+            if(startAddress == 0 && endAddress == ulong.MaxValue)
+            {
+                // <0, ulong.MaxValue> ranges aren't currently supported
+                endAddress -= 1;
+            }
+
+            ICPUWithMappedMemory cpu = null;
+            var busRanges = new List<BusRangeRegistration>();
+            foreach(var context in sysbus.GetAllContextKeys())
+            {
+                foreach(var registration in sysbus.GetRegisteredPeripherals(context))
+                {
+                    if(registration.Peripheral != this)
+                    {
+                        continue;
+                    }
+                    var initiator = registration.RegistrationPoint.Initiator;
+                    if(initiator == null)
+                    {
+                        this.WarningLog("Peripheral must have unambiguous cpu initiator to support mapping of DMI region, try registering it for cpu context");
+                        return;
+                    }
+                    else
+                    {
+                        if(cpu != null && initiator != cpu)
+                        {
+                            this.WarningLog("Peripheral must have unambiguous cpu initiator to support mapping of DMI region, try registering it for cpu context");
+                            return;
+                        }
+                        if(initiator is ICPUWithMappedMemory cpuWithMappedMemory)
+                        {
+                            cpu = cpuWithMappedMemory;
+                            busRanges.Add(registration.RegistrationPoint);
+                        }
+                    }
+                }
+            }
+
+            if(!(cpu is TranslationCPU translationCpu))
+            {
+                return;
+            }
+
+            lock(mappedDmiRanges)
+            {
+                var range = startAddress.To(endAddress);
+                var intersectingRanges = mappedDmiRanges.Select(collectionRange => collectionRange.Intersect(range)).Where(r => r.HasValue);
+                foreach(var intersectingRange in intersectingRanges)
+                {
+                    foreach(var busRange in busRanges)
+                    {
+                        var invalidatedRange = new Range(checked(busRange.Range.StartAddress + intersectingRange.Value.StartAddress), intersectingRange.Value.Size);
+                        sysbus.UnmapMemory(invalidatedRange, context: cpu);
+                        translationCpu.OrderTranslationBlocksInvalidation(checked((nint)invalidatedRange.StartAddress), checked((nint)invalidatedRange.EndAddress));
+                        this.DebugLog("Unmapped SystemC DMI region {0}", invalidatedRange);
+                    }
+                }
+                mappedDmiRanges.Remove(range);
+            }
+        }
+
+        private byte GetExtensionFields(out bool secure, out bool privileged)
+        {
+            if(!sysbus.TryGetCurrentContextState<CortexM.ContextState>(out var initiator, out var cpuState))
+            {
+                // Default values when context isn't available.
+                secure = true;
+                privileged = true;
+            }
+            else
+            {
+                secure = cpuState.CpuSecure;
+                privileged = cpuState.Privileged;
+            }
+
+            return GetExtensionFieldsMask(secure, privileged);
+        }
+
+        private byte GetExtensionFieldsMask(bool secure, bool privileged)
+        {
+            byte mask = 0;
+            if(secure)
+            {
+                mask |= 1 << 4;
+            }
+            if(privileged)
+            {
+                mask |= 1 << 5;
+            }
+            return mask;
+        }
+
+        private bool disableNativeDmi;
+        private readonly LimitTimer timesyncTimer;
         private readonly Dictionary<int, IDirectAccessPeripheral> directAccessPeripherals;
-
-        private readonly Thread backwardThread;
-        private readonly bool disableTimeoutCheck;
-        private readonly int requestedPort;
-
-        private readonly string address;
-        private readonly object messageLock;
+        private readonly MinimalRangesCollection mappedDmiRanges = new MinimalRangesCollection();
         private readonly int timeSyncPeriodUS;
-
         private readonly IBusController sysbus;
-        private readonly IMachine machine;
 
         // NumberOfGPIOPins must be equal to renode_bridge.h:NUM_GPIO
-        private const int NumberOfGPIOPins = 64;
+        private const int NumberOfGPIOPins = 1024;
+        private const int DmiSupported = 1;
+
+        private sealed class DmiMappedSegment : IMappedSegment
+        {
+            public DmiMappedSegment(ulong startingOffset, ulong size, IntPtr pointer)
+            {
+                StartingOffset = startingOffset;
+                Size = size;
+                Pointer = pointer;
+            }
+
+            public void Touch()
+            {
+                // intentionally left blank
+            }
+
+            public IntPtr Pointer { get; }
+
+            public ulong StartingOffset { get; }
+
+            public ulong Size { get; }
+        }
     }
 }

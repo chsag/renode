@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2024 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -32,29 +32,29 @@ namespace Antmicro.Renode.Network.ExternalControl
             disposed = true;
         }
 
-        public override Response Invoke(List<byte> data)
+        public override MessagePayload Invoke(List<byte> data)
         {
             if(disposed)
             {
-                return Response.CommandFailed(Identifier, "Command is unavailable");
+                return MessagePayload.Error(Identifier, "Command is unavailable");
             }
 
             if(data.Count != 8)
             {
-                return Response.CommandFailed(Identifier, "Expected 8 bytes of payload");
+                return MessagePayload.Error(Identifier, "Expected 8 bytes of payload");
             }
 
             if(cancellationToken != null)
             {
-                return Response.CommandFailed(Identifier, "One RunFor command can be running at any given time");
+                return MessagePayload.Error(Identifier, "One RunFor command can be running at any given time");
             }
 
             cancellationToken = new CancellationTokenSource();
             exception = null;
             success = false;
 
-            var microseconds = BitConverter.ToUInt64(data.ToArray(), 0);
-            var interval = TimeInterval.FromMicroseconds(microseconds);
+            var nanoseconds = BitConverter.ToUInt64(data.ToArray(), 0);
+            var interval = TimeInterval.FromNanoseconds(nanoseconds);
 
             var thread = new Thread(() =>
             {
@@ -92,14 +92,12 @@ namespace Antmicro.Renode.Network.ExternalControl
 
             if(success)
             {
-                return Response.Success(Identifier);
+                return MessagePayload.Success(Identifier);
             }
-            return Response.CommandFailed(Identifier, "RunFor was interrupted");
+            return MessagePayload.Error(Identifier, "RunFor was interrupted");
         }
 
         public override Command Identifier => Command.RunFor;
-
-        public override byte Version => 0x0;
 
         private bool success;
         private Exception exception;

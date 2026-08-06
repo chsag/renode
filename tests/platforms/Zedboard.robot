@@ -1,5 +1,5 @@
 *** Settings ***
-Library                             tap_helper.py    # used for 'Precofingure Macos' keyword
+Library                             vmnet_helper.py  # used for 'Preconfigure Vmnet Helper' keyword
 
 *** Variables ***
 ${UART}                             sysbus.uart0
@@ -55,7 +55,8 @@ ${UFS_HOST_TASK_MGMT_SLOTS}         8
 
 ${UFS_DEVICE_LOGICAL_UNITS}         4
 ${UFS_DEVICE_LOGICAL_BLOCK_SIZE}    4096
-${UFS_DEVICE_BLOCK_COUNT}           65536
+${UFS_DEVICE_BLOCK_COUNT}           65536  # Default
+${UFS_DEVICE_BLOCK_COUNTS}          [8192, 16384, 32768]  # Last one will come from UFS_DEVICE_BLOCK_COUNT
 
 ${UFS_DEVICE_MANUFACTURER_NAME}     "Antmicro"
 ${UFS_DEVICE_PRODUCT_NAME}          "RenodeUFSStorage"
@@ -104,6 +105,7 @@ ${UFS_DEVICE_PERIPHERAL}            SEPARATOR=\n
 ...                                 ${SPACE*4}serialNumber: ${UFS_DEVICE_SERIAL_NUMBER}
 ...                                 ${SPACE*4}oemID: ${UFS_DEVICE_OEM_ID}
 ...                                 ${SPACE*4}productRevisionLevel: ${UFS_DEVICE_PRODUCT_REV_LEVEL}
+...                                 ${SPACE*4}logicalUnitBlockCounts: ${UFS_DEVICE_BLOCK_COUNTS}
 ...                                 """
 
 ${DEFAULT_IRQ_TEST}                 SEPARATOR=\n
@@ -220,6 +222,10 @@ Map Index To Disk Letter
     [Arguments]                     ${index}
     ${letter}=                      Evaluate    chr(97 + ${index})
     RETURN                          ${letter}
+
+Test Teardown And Kill Vmnet Helper
+    Kill Vmnet Helper
+    Test Teardown
 
 *** Test Cases ***
 Should Boot And Login
@@ -401,6 +407,26 @@ Should Access UFS Storage
         Execute Linux Command           umount ${MOUNT_POINT}
     END
 
+Should Report Specified UFS Logical Unit Sizes
+    Requires                        ufs-logged-in
+
+    ${BLOCK_COUNTS}=                Evaluate  ast.literal_eval($UFS_DEVICE_BLOCK_COUNTS)  ast
+    ${EFFECTIVE_BLOCK_COUNTS}=      Evaluate  $BLOCK_COUNTS[:${UFS_DEVICE_LOGICAL_UNITS}] + [${UFS_DEVICE_BLOCK_COUNT}] * max(0, ${UFS_DEVICE_LOGICAL_UNITS} - len($BLOCK_COUNTS))
+
+    # Check that the fallback/default size logic works
+    ${MODEL_BLOCK_COUNTS}=          Execute Command  ufs.ufsStorage LogicalUnitBlockCounts
+    ${MODEL_BLOCK_COUNTS}=          Evaluate  ast.literal_eval($MODEL_BLOCK_COUNTS)  ast
+    Should Be Equal                 ${EFFECTIVE_BLOCK_COUNTS}  ${MODEL_BLOCK_COUNTS}
+
+    # Check that guest software sees the configured sizes
+    ${SECTOR_COUNTS_512B}=          Evaluate  [math.ceil(bs / 512 * ${UFS_DEVICE_LOGICAL_BLOCK_SIZE}) for bs in $EFFECTIVE_BLOCK_COUNTS]  math
+
+    Write Line To Uart              fdisk -l /dev/sd*
+
+    FOR  ${i}  ${count}  IN ENUMERATE  @{SECTOR_COUNTS_512B}
+        Wait For Line On Uart           Disk /dev/sd${{chr(ord('a') + $i)}}: .*, ${count} sectors  treatAsRegex=true
+    END
+
 Should Load Disk Image For UFS Storage From File
     Requires                        ufs-logged-in
 
@@ -515,7 +541,7 @@ Should Ping
     Wait For Prompt On Uart         ${PROMPT}  testerId=${tester1}
 
 Should Ping Over TAP
-    [Tags]                          ethernet  tap  basic-tests
+    [Tags]                          ethernet  tap  basic-tests  exclude_osx
     Requires                        logged-in
 
     Set Test Variable               ${TAP_INTERFACE}  tap0
@@ -526,7 +552,6 @@ Should Ping Over TAP
     Execute Command                 emulation CreateSwitch "switch"
     Execute Command                 emulation CreateTap "${TAP_INTERFACE}" "tap"
 
-    Preconfigure Macos              tap0  ${TAP_INTERFACE_IP}  255.255.255.0
     Network Interface Should Have Address  ${TAP_INTERFACE}  ${TAP_INTERFACE_IP}
 
     Execute Command                 connector Connect host.tap switch
@@ -536,6 +561,31 @@ Should Ping Over TAP
 
     Write Line To Uart              ping -c 5 ${TAP_INTERFACE_IP}
     Wait For Line On Uart           5 packets transmitted, 5 packets received, 0% packet loss
+
+Should Ping Over Vmnet Helper
+    [Tags]                          ethernet  vmnet  exclude_windows  exclude_linux
+    Requires                        logged-in
+
+    Set Test Variable               ${TAP_INTERFACE_IP}  192.168.18.2
+    Set Test Variable               ${START_IP}  192.168.18.1
+    Set Test Variable               ${END_IP}  192.168.18.20
+    Set Test Variable               ${MASK}  255.255.255.0
+
+    ${TMP_DIR}=                     Evaluate  __import__('tempfile').mkdtemp()  modules=tempfile
+    ${SOCKET_PATH}=                 Join Path  ${TMP_DIR}  vmnet_helper.sock
+
+    Preconfigure Vmnet Helper       ${START_IP}  ${END_IP}  ${MASK}  ${SOCKET_PATH}
+
+    Execute Command                 emulation CreateSwitch "switch"
+    Execute Command                 emulation CreateVmnetHelper "${SOCKET_PATH}" "vmnet"
+    Execute Command                 connector Connect host.vmnet switch
+    Execute Command                 connector Connect gem0 switch
+
+    Execute Linux Command           ifconfig eth0 up ${TAP_INTERFACE_IP}
+    Write Line To Uart              ping -c 5 ${START_IP}
+    Wait For Line On Uart           5 packets transmitted, 5 packets received, 0% packet loss
+
+    [Teardown]                      Test Teardown And Kill Vmnet Helper
 
 Should Pass Default Interrupt Test
     # This test checks `DefaultInterrupt` behavior with named and unnamed GPIOs

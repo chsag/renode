@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -21,7 +21,7 @@ namespace Antmicro.Renode.Peripherals.CoSimulated
 {
     public class CoSimulatedCFU : ICFU, ICoSimulationConnectible, IDisposable
     {
-        public CoSimulatedCFU(Machine machine, long frequency = 0, ulong limitBuffer = LimitBuffer, int timeout = DefaultTimeout, int exitTimeout = DefaultExitTimeout)
+        public CoSimulatedCFU(Machine machine, ulong frequency = 0, ulong limitBuffer = LimitBuffer, int timeout = DefaultTimeout, int exitTimeout = DefaultExitTimeout)
         {
             // Multiple CoSimulatedCFUs per CoSimulationConnection are currently not supported.
             RenodeToCosimIndex = 0;
@@ -138,9 +138,10 @@ namespace Antmicro.Renode.Peripherals.CoSimulated
             get => connection.SimulationFilePathLinux;
             set
             {
-#if PLATFORM_LINUX
-                SimulationFilePath = value;
-#endif
+                if(RuntimeInfo.IsLinux())
+                {
+                    SimulationFilePath = value;
+                }
             }
         }
 
@@ -149,9 +150,10 @@ namespace Antmicro.Renode.Peripherals.CoSimulated
             get => connection.SimulationFilePathWindows;
             set
             {
-#if PLATFORM_WINDOWS
-                SimulationFilePath = value;
-#endif
+                if(RuntimeInfo.IsWindows())
+                {
+                    SimulationFilePath = value;
+                }
             }
         }
 
@@ -160,9 +162,10 @@ namespace Antmicro.Renode.Peripherals.CoSimulated
             get => connection.SimulationFilePathMacOS;
             set
             {
-#if PLATFORM_OSX
-                SimulationFilePath = value;
-#endif
+                if(RuntimeInfo.IsMacOS())
+                {
+                    SimulationFilePath = value;
+                }
             }
         }
 
