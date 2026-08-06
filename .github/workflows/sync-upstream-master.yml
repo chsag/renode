@@ -13,10 +13,9 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out master
+      - name: Check out repository history
         uses: actions/checkout@v4
         with:
-          ref: master
           fetch-depth: 0
 
       - name: Sync master and create pull request
@@ -24,16 +23,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           gh api \
             --method POST \
             "/repos/${GITHUB_REPOSITORY}/merge-upstream" \
             -f branch=master
           git fetch origin master custom-master
-          git checkout --detach origin/master
 
-          if git merge-base --is-ancestor master origin/custom-master; then
+          if git merge-base --is-ancestor origin/master origin/custom-master; then
             echo "custom-master already contains master."
             exit 0
           fi
