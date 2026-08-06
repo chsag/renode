@@ -26,10 +26,12 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/renode/renode.git
-          git fetch upstream master
-          git merge --ff-only upstream/master
-          git push origin master
+          gh api \
+            --method POST \
+            "/repos/${GITHUB_REPOSITORY}/merge-upstream" \
+            -f branch=master
+          git fetch origin master custom-master
+          git checkout --detach origin/master
 
           if git merge-base --is-ancestor master origin/custom-master; then
             echo "custom-master already contains master."
