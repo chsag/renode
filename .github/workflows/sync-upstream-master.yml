@@ -49,3 +49,57 @@ jobs:
             --head master \
             --title "Sync upstream master" \
             --body "Automated pull request to merge the fork's master branch, synchronized from https://github.com/renode/renode, into custom-master."
+
+  sync-infrastructure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out custom master with submodules
+        uses: actions/checkout@v4
+        with:
+          ref: custom-master
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Create pull request for infrastructure update
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git -C src/Infrastructure fetch origin custom-master
+
+          current=$(git rev-parse HEAD:src/Infrastructure)
+          target=$(git -C src/Infrastructure rev-parse origin/custom-master)
+          if [ "$current" = "$target" ]; then
+            echo "custom-master already uses the latest renode-infrastructure."
+            exit 0
+          fi
+
+          if gh pr list \
+            --base custom-master \
+            --state open \
+            --search 'in:title "Update renode-infrastructure"' \
+            --json number \
+            --jq 'length > 0' | grep -qx true; then
+            echo "An infrastructure update pull request is already open."
+            exit 0
+          fi
+
+          branch="update-renode-infrastructure-${target:0:12}"
+          if git ls-remote --exit-code --heads origin "$branch"; then
+            echo "The update branch $branch already exists."
+            exit 1
+          fi
+
+          git switch --create "$branch" origin/custom-master
+          git -C src/Infrastructure checkout --detach "$target"
+          git add src/Infrastructure
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update renode-infrastructure"
+          git push --set-upstream origin "$branch"
+
+          gh pr create \
+            --base custom-master \
+            --head "$branch" \
+            --title "Update renode-infrastructure" \
+            --body "Automated pull request to update src/Infrastructure to ${target}."
