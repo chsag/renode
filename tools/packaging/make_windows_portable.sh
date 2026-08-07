@@ -35,9 +35,8 @@ mkdir -p ../../output/packages
 # Absolute path to use the Windows builtin BSD tar instead of minGW tar
 /c/Windows/SysWOW64/tar.exe -a -c -f "../../output/packages/$ZIP_NAME" $DIR
 
-# Build installer
-if ! $HEADLESS
-then
+# Build installer unless the portable-only workflow explicitly disables it.
+if ! $HEADLESS && [ "${RENODE_SKIP_WINDOWS_INSTALLER:-false}" != "true" ]; then
     export BASE
     export VERSION
     windows_package_src=$DIR iscc "windows/renode.iss"

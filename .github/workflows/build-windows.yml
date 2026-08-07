@@ -5,6 +5,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
@@ -23,20 +30,37 @@ jobs:
       - name: Install build dependencies
         shell: pwsh
         run: |
-          choco install mingw cmake innosetup --no-progress --yes
+          choco install mingw cmake --no-progress --yes
           'C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin' | Out-File -FilePath $env:GITHUB_PATH -Append
-          'C:\Program Files (x86)\Inno Setup 6' | Out-File -FilePath $env:GITHUB_PATH -Append
 
-      - name: Build portable package and installer
+      - name: Build portable package
         shell: bash
         run: |
           rm src/Plugins/SystemCPlugin/SystemCModule/lib/socket-cpp
           mkdir -p src/Plugins/SystemCPlugin/SystemCModule/lib/socket-cpp
-          ./build.sh -t
+          RENODE_SKIP_WINDOWS_INSTALLER=true ./build.sh -t
 
       - name: Upload Windows packages
         uses: actions/upload-artifact@v4
         with:
           name: renode-windows
-          path: output/packages/*
+          path: output/packages/*.windows-portable.zip
           if-no-files-found: error
+
+      - name: Publish nightly release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/custom-master'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git tag --force nightly "$GITHUB_SHA"
+          git push --force origin refs/tags/nightly
+
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release edit nightly --title "Nightly" --prerelease --notes "Automated build from ${GITHUB_SHA}."
+          else
+            gh release create nightly --title "Nightly" --prerelease --notes "Automated build from ${GITHUB_SHA}."
+          fi
+
+          gh release upload nightly output/packages/*.windows-portable.zip --clobber
