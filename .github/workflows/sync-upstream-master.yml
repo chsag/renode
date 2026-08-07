@@ -60,21 +60,52 @@ jobs:
             exit 0
           fi
 
+          master=$(git rev-parse origin/master)
+          custom=$(git rev-parse origin/custom-master)
+          branch="sync-upstream-master-${master:0:12}-into-${custom:0:12}"
+
           if gh pr list \
             --base custom-master \
-            --head master \
+            --head "$branch" \
             --state open \
             --json number \
             --jq 'length > 0' | grep -qx true; then
-            echo "An open pull request from master to custom-master already exists."
+            echo "An open pull request for this upstream sync already exists."
             exit 0
           fi
 
+          if git ls-remote --exit-code --heads origin "$branch"; then
+            echo "The sync branch $branch already exists without an open pull request."
+            exit 1
+          fi
+
+          git switch --create "$branch" origin/custom-master
+          git -C src/Infrastructure checkout --detach "$current"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git merge --no-commit --no-ff origin/master; then
+            conflicts=$(git diff --name-only --diff-filter=U)
+            if [ "$conflicts" != "src/Infrastructure" ]; then
+              git merge --abort
+              echo "Upstream merge has conflicts outside src/Infrastructure."
+              exit 1
+            fi
+
+            # The gate above verified this gitlink includes master's target commit.
+            git checkout --ours src/Infrastructure
+          fi
+
+          git -C src/Infrastructure checkout --detach "$current"
+          git add src/Infrastructure
+          git commit -m "Sync upstream master"
+          git push --set-upstream origin "$branch"
+
           gh pr create \
             --base custom-master \
-            --head master \
+            --head "$branch" \
             --title "Sync upstream master" \
-            --body "Automated pull request to merge the fork's master branch, synchronized from https://github.com/renode/renode, into custom-master."
+            --body "Automated pull request to merge the fork's master branch, synchronized from https://github.com/renode/renode, into custom-master. The validated custom src/Infrastructure gitlink is retained to keep the pull request mergeable."
 
   sync-infrastructure:
     runs-on: ubuntu-latest
