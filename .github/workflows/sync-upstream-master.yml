@@ -3,6 +3,9 @@ name: Sync upstream master
 on:
   schedule:
     - cron: "0 6 * * 1"
+  push:
+    branches:
+      - custom-master
   workflow_dispatch:
 
 permissions:
@@ -11,6 +14,8 @@ permissions:
 
 jobs:
   sync:
+    needs: sync-infrastructure
+    if: needs.sync-infrastructure.outputs.ready == 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository history
@@ -108,6 +113,8 @@ jobs:
             --body "Automated pull request to merge the fork's master branch, synchronized from https://github.com/renode/renode, into custom-master. The validated custom src/Infrastructure gitlink is retained to keep the pull request mergeable."
 
   sync-infrastructure:
+    outputs:
+      ready: ${{ steps.check-infrastructure.outputs.ready }}
     runs-on: ubuntu-latest
     steps:
       - name: Check out custom master with submodules
@@ -118,16 +125,19 @@ jobs:
           submodules: recursive
 
       - name: Create pull request for infrastructure update
+        id: check-infrastructure
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          echo "ready=false" >> "$GITHUB_OUTPUT"
           git -C src/Infrastructure fetch origin custom-master
 
           current=$(git rev-parse HEAD:src/Infrastructure)
           target=$(git -C src/Infrastructure rev-parse origin/custom-master)
           if [ "$current" = "$target" ]; then
             echo "custom-master already uses the latest renode-infrastructure."
+            echo "ready=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
