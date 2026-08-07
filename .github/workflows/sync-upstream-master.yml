@@ -34,6 +34,32 @@ jobs:
             exit 0
           fi
 
+          git submodule update --init src/Infrastructure
+          git -C src/Infrastructure fetch origin custom-master
+
+          if ! current=$(git rev-parse origin/custom-master:src/Infrastructure 2>/dev/null); then
+            echo "custom-master does not contain src/Infrastructure."
+            exit 0
+          fi
+
+          if ! target=$(git rev-parse origin/master:src/Infrastructure 2>/dev/null); then
+            echo "master does not contain src/Infrastructure."
+            exit 0
+          fi
+
+          infrastructure_custom=$(git -C src/Infrastructure rev-parse origin/custom-master)
+
+          if [ "$current" != "$infrastructure_custom" ]; then
+            echo "custom-master must first be updated to renode-infrastructure custom-master."
+            exit 0
+          fi
+
+          if ! git -C src/Infrastructure cat-file -e "${target}^{commit}" 2>/dev/null || \
+             ! git -C src/Infrastructure merge-base --is-ancestor "$target" "$current"; then
+            echo "renode-infrastructure custom-master does not yet contain master's infrastructure commit."
+            exit 0
+          fi
+
           if gh pr list \
             --base custom-master \
             --head master \
