@@ -4,6 +4,7 @@
 // This file is licensed under MIT License.
 // Full license text is available in 'licenses/MIT.txt' file.
 //
+#include "renode_api.h"
 #include <fcntl.h>
 #include <inttypes.h>
 #include <netdb.h>
@@ -39,9 +40,22 @@ struct renode_gpio {
     int32_t id;
 };
 
+struct renode_can {
+    renode_machine_t *machine;
+    int32_t id;
+};
+
 struct renode_bus_context {
     renode_machine_t *machine;
     int32_t id;
+};
+
+struct renode_spi {
+    renode_machine_t *machine;
+    int32_t id;
+    void *user_data;
+    renode_spi_transmit_callback_t on_transmit;
+    renode_spi_finish_callback_t on_finish;
 };
 
 void renode_free_error(renode_error_t *error)
@@ -64,38 +78,13 @@ void renode_set_fatal_error_callback(renode_t *renode, void *user_data, renode_f
 #define ERRMSG_UNEXPECTED_RESPONSE_PAYLOAD_SIZE "Received unexpected number of bytes"
 #define ERRMSG_COMMAND_MISMATCH "Received mismatched command"
 
-// Needs to be in sync with `Antmicro.Renode.Network.ExternalControl.Command` in C#
-typedef enum {
-    CHECK_VERSION = 0,
-    RUN_FOR,
-    GET_TIME,
-    GET_MACHINE,
-    ADC,
-    GPIO,
-    SYSTEM_BUS,
-} api_command_t;
-
-// Needs to be in sync with `Antmicro.Renode.Network.ExternalControl.CommandType` in C#
-typedef enum {
-    TYPE_REQUEST = 0x0,
-    TYPE_EVENT_REQUEST = 0x1,
-    TYPE_SUCCESS = 0x2,
-    TYPE_INVALID_COMMAND = 0x3,
-    TYPE_ERROR = 0x4,
-} command_type_t;
-
-// Needs to be in sync with `Antmicro.Renode.Network.ExternalControl.MessagePayload` in C#
-typedef struct __attribute__((packed)) {
-    uint16_t command;
-    uint8_t type;
-} message_payload_t;
-
 #define REQUEST_HEADER(cmd) {&(const message_payload_t){ cmd, TYPE_REQUEST }, sizeof(message_payload_t)}
+#define RESPONSE_HEADER(cmd, type) {&(const message_payload_t){ cmd, type }, sizeof(message_payload_t)}
 
-// Needs to be in sync with `Antmicro.Renode.Network.ExternalControl.GetVersion.ProtocolVersion` in C#
-static const uint32_t PROTOCOL_VERSION = 0;
+#define assert_response(x, msg) do { if (unlikely(!(x))) { fprintf(stderr, "Assert not met in %s:%d: %s\n", __FILE__, __LINE__, #x); return renode_connection_send_message(conn, id, RESPONSE_HEADER(cmd, TYPE_ERROR), {msg, sizeof(msg)}); } } while (0)
 
-static renode_error_t *generic_handler(renode_connection_t *conn, const void *response, size_t size, void *ud);
+static renode_error_t *generic_response_handler(renode_connection_t *conn, const void *response, size_t size, void *ud);
+static renode_error_t *generic_request_handler(renode_connection_t *conn, uint16_t id, const void *response, size_t size, void *ud);
 static renode_error_t *parse_response(const void *response, size_t size, message_payload_t *header, const void **data, uint32_t *data_size);
 
 static renode_error_t *check_version_handler(renode_connection_t *conn, const void *response, size_t size, void *ud)
@@ -122,15 +111,17 @@ renode_error_t *renode_connect(const char *port, renode_t **renode)
     return_error_if_fails(renode_connection_open(&conn, &(renode_connection_config_t) {
         .address = "localhost",
         .port = port,
+        .request_callback = generic_request_handler,
+        .server_request_ud = NULL,
     }));
 
-    renode_error_t *err = renode_connection_send(conn, check_version_handler, NULL,
+    renode_error_t *err = renode_connection_send_request(conn, check_version_handler, NULL,
         REQUEST_HEADER(CHECK_VERSION),
         {&PROTOCOL_VERSION, sizeof(PROTOCOL_VERSION)},
     );
 
     if (err != NO_ERROR) {
-        renode_connection_close(conn);
+        renode_connection_close(conn, /*blocking=*/true);
         return err;
     }
 
@@ -142,9 +133,14 @@ renode_error_t *renode_connect(const char *port, renode_t **renode)
 
 renode_error_t *renode_disconnect(renode_t **renode)
 {
+    return renode_disconnect_ex(renode, /*blocking=*/true);
+}
+
+renode_error_t *renode_disconnect_ex(renode_t **renode, bool blocking)
+{
     assert(renode != NULL && *renode != NULL);
 
-    return_error_if_fails(renode_connection_close((*renode)->conn));
+    return_error_if_fails(renode_connection_close((*renode)->conn, blocking));
     free(*renode);
     *renode = NULL;
 
@@ -154,7 +150,6 @@ renode_error_t *renode_disconnect(renode_t **renode)
 #define MAX_CALLBACK_COUNT 1024
 
 typedef void (*raw_callback_t)(void *, void *);
-
 static raw_callback_t callbacks[MAX_CALLBACK_COUNT];
 static void *callback_user_data[MAX_CALLBACK_COUNT];
 static int32_t callbacks_count;
@@ -172,22 +167,68 @@ static renode_error_t *register_callback(raw_callback_t callback, void *user_dat
     return NO_ERROR;
 }
 
-static renode_error_t *invoke_callback(api_command_t cmd, int32_t ed, const void *data, size_t size)
+// SPI event types (server -> client, in the event payload's first byte), must match SpiEvent in SPI.cs
+typedef enum {
+    SPI_EVENT_TRANSMIT = 0,
+    SPI_EVENT_FINISH_TRANSMISSION = 1,
+} spi_event_t;
+
+static renode_error_t *invoke_callback(renode_connection_t *conn, uint16_t id, api_command_t cmd, int32_t ed, const void *data, size_t size)
 {
+    assert_response(ed < callbacks_count, "Tried to invoke callback for an invalid event descriptor");
     switch(cmd)
     {
     case GPIO:
-        assert_msg(ed < callbacks_count, "Tried to invoke callback for an invalid event descriptor");
-        assert_msg(size == sizeof(renode_gpio_event_data_t), ERRMSG_UNEXPECTED_RESPONSE_PAYLOAD_SIZE);
+        assert_response(size == sizeof(renode_gpio_event_data_t), ERRMSG_UNEXPECTED_RESPONSE_PAYLOAD_SIZE);
+
         renode_gpio_event_data_t event_data;
         memcpy(&event_data, data, sizeof(event_data));
 
         callbacks[ed](callback_user_data[ed], &event_data);
-        return NO_ERROR;
+        return renode_connection_send_message(conn, id, RESPONSE_HEADER(cmd, TYPE_SUCCESS));
+    case CAN_BUS:
+        assert_response(size >= sizeof(renode_can_event_data_t), ERRMSG_UNEXPECTED_RESPONSE_PAYLOAD_SIZE);
+        assert_response(size <= sizeof(renode_can_event_data_t) + MAX_CAN_FRAME_SIZE, ERRMSG_UNEXPECTED_RESPONSE_PAYLOAD_SIZE);
+
+        renode_can_event_data_t *can_data;
+        can_data = xmalloc(size);
+        memcpy(can_data, data, size);
+
+        callbacks[ed](callback_user_data[ed], can_data);
+        assert_response(size == sizeof(renode_can_event_data_t) + can_data->packet_length, ERRMSG_UNEXPECTED_RESPONSE_PAYLOAD_SIZE);
+        renode_error_t *result = renode_connection_send_message(conn, id, RESPONSE_HEADER(cmd, TYPE_SUCCESS));
+        free(can_data);
+        return result;
+    case TIME_ELAPSED_CALLBACK:
+        assert_response(size == sizeof(renode_time_t), ERRMSG_UNEXPECTED_RESPONSE_PAYLOAD_SIZE);
+
+        renode_time_t timestamp;
+        memcpy(&timestamp, data, sizeof(timestamp));
+
+        callbacks[ed](callback_user_data[ed], &timestamp);
+        return renode_connection_send_message(conn, id, RESPONSE_HEADER(cmd, TYPE_SUCCESS));
+    case SPI:
+        assert_response(size >= 1, ERRMSG_UNEXPECTED_RESPONSE_PAYLOAD_SIZE);
+        renode_spi_t *spi = callback_user_data[ed];
+
+        switch(((uint8_t*)data)[0])
+        {
+        case SPI_EVENT_TRANSMIT:
+            assert_response(size == 2, ERRMSG_UNEXPECTED_RESPONSE_PAYLOAD_SIZE);
+
+            uint8_t miso = spi->on_transmit(spi->user_data, ((uint8_t*)data)[1]);
+            return renode_connection_send_message(conn, id, RESPONSE_HEADER(cmd, TYPE_SUCCESS), {&miso, sizeof(miso)});
+        case SPI_EVENT_FINISH_TRANSMISSION:
+            if (spi->on_finish) {
+                spi->on_finish(spi->user_data);
+            }
+            return renode_connection_send_message(conn, id, RESPONSE_HEADER(cmd, TYPE_SUCCESS));
+        default:
+            return create_fatal_error_static("Received unknown SPI event type");
+        }
     default:
-        assert_msg(false, "Tried to invoke callback for an invalid command");
+        return renode_connection_send_message(conn, id, RESPONSE_HEADER(cmd, TYPE_INVALID_COMMAND));
     }
-    return create_fatal_error_static("Unreachable logic reached");
 }
 
 static renode_error_t *get_machine_handler(renode_connection_t *conn, const void *data, size_t size, void *ud)
@@ -204,7 +245,7 @@ renode_error_t *renode_get_machine(renode_t *renode, const char *name, renode_ma
 {
     int32_t id;
     uint32_t name_length = strlen(name);
-    return_error_if_fails(renode_connection_send(renode->conn, generic_handler, &id,
+    return_error_if_fails(renode_connection_send_request(renode->conn, generic_response_handler, &id,
         REQUEST_HEADER(GET_MACHINE),
         {&name_length, sizeof(name_length)},
         {name, name_length},
@@ -290,7 +331,7 @@ static renode_error_t *renode_get_instance_descriptor(renode_machine_t *machine,
     *instance_descriptor = -1;
 
     // ASSUMPTION: Obtaining an instance cannot generate side-effects
-    return renode_connection_send(machine->renode->conn, get_instance_handler, instance_descriptor,
+    return renode_connection_send_request(machine->renode->conn, get_instance_handler, instance_descriptor,
         REQUEST_HEADER(api_command),
         {instance_descriptor, sizeof(*instance_descriptor)},
         {&machine->md, sizeof(machine->md)},
@@ -303,7 +344,7 @@ renode_error_t *renode_run_for(renode_t *renode, renode_time_t time)
 {
     assert(renode != NULL);
 
-    return renode_connection_send(renode->conn, generic_handler, NULL,
+    return renode_connection_send_request(renode->conn, generic_response_handler, NULL,
         REQUEST_HEADER(RUN_FOR),
         {&time, sizeof(time)},
     );
@@ -322,9 +363,20 @@ renode_error_t *renode_get_current_time(renode_t *renode, renode_time_t *current
 {
     assert(renode != NULL);
 
-    return renode_connection_send(renode->conn, generic_handler, current_time,
+    return renode_connection_send_request(renode->conn, generic_response_handler, current_time,
         REQUEST_HEADER(GET_TIME),
         {current_time, sizeof(*current_time)},
+    );
+}
+
+renode_error_t *renode_register_time_elapsed_callback(renode_t *renode, void *user_data, renode_time_elapsed_callback_t callback)
+{
+    int32_t ed;
+    return_error_if_fails(register_callback((raw_callback_t)callback, user_data, &ed));
+
+    return renode_connection_send_request(renode->conn, generic_response_handler, NULL,
+        REQUEST_HEADER(TIME_ELAPSED_CALLBACK),
+        {&ed, sizeof(ed)},
     );
 }
 
@@ -383,7 +435,7 @@ renode_error_t *renode_get_adc_channel_count(renode_adc_t *adc, int32_t *count)
         },
     };
 
-    return_error_if_fails(renode_connection_send(adc->machine->renode->conn, generic_handler, &cmd,
+    return_error_if_fails(renode_connection_send_request(adc->machine->renode->conn, generic_response_handler, &cmd,
         REQUEST_HEADER(ADC),
         {&cmd, sizeof(cmd.header)},
     ));
@@ -401,7 +453,7 @@ renode_error_t *renode_get_adc_channel_value(renode_adc_t *adc, int32_t channel,
         },
     };
 
-    return_error_if_fails(renode_connection_send(adc->machine->renode->conn, generic_handler, &cmd,
+    return_error_if_fails(renode_connection_send_request(adc->machine->renode->conn, generic_response_handler, &cmd,
         REQUEST_HEADER(ADC),
         {&cmd, sizeof(cmd.header)},
         {&channel, sizeof(channel)},
@@ -420,7 +472,7 @@ renode_error_t *renode_set_adc_channel_value(renode_adc_t *adc, int32_t channel,
         },
     };
 
-    return renode_connection_send(adc->machine->renode->conn, generic_handler, &cmd,
+    return renode_connection_send_request(adc->machine->renode->conn, generic_response_handler, &cmd,
         REQUEST_HEADER(ADC),
         {&cmd, sizeof(cmd.header)},
         {&channel, sizeof(channel)},
@@ -485,7 +537,7 @@ renode_error_t *renode_get_gpio_state(renode_gpio_t *gpio, int32_t id, bool *sta
         },
     };
 
-    return_error_if_fails(renode_connection_send(gpio->machine->renode->conn, generic_handler, &cmd,
+    return_error_if_fails(renode_connection_send_request(gpio->machine->renode->conn, generic_response_handler, &cmd,
         REQUEST_HEADER(GPIO),
         {&cmd.header, sizeof(cmd.header)},
     ));
@@ -505,7 +557,7 @@ renode_error_t *renode_set_gpio_state(renode_gpio_t *gpio, int32_t id, bool stat
         .state = state,
     };
 
-    return renode_connection_send(gpio->machine->renode->conn, generic_handler, &cmd,
+    return renode_connection_send_request(gpio->machine->renode->conn, generic_response_handler, &cmd,
         REQUEST_HEADER(GPIO),
         {&cmd.header, sizeof(cmd.header)},
         {&cmd.state, sizeof(cmd.state)},
@@ -530,8 +582,77 @@ renode_error_t *renode_register_gpio_state_change_callback(renode_gpio_t *gpio, 
         },
     };
 
-    return renode_connection_send(gpio->machine->renode->conn, generic_handler, &cmd,
+    return renode_connection_send_request(gpio->machine->renode->conn, generic_response_handler, &cmd,
         REQUEST_HEADER(GPIO),
+        {&cmd.header, sizeof(cmd.header)},
+        {&ed, sizeof(ed)},
+    );
+}
+
+typedef enum 
+{
+    SEND_FRAME = 0,
+    RECEIVED_FRAME = 1,
+    REGISTER_CALLBACKS = 2,
+} canbus_operation_t;
+
+typedef struct {
+    struct __attribute__((packed)) {
+        int32_t id;
+        int8_t command;
+    } header;
+    int32_t packet_length;
+    uint32_t id;
+    void * packet;
+} canbus_command_t;
+
+renode_error_t *renode_get_can(renode_machine_t *machine, const char *name, renode_can_t **can)
+{
+    int32_t id;
+    return_error_if_fails(renode_get_instance_descriptor(machine, CAN_BUS, name, &id));
+
+    *can = xmalloc(sizeof(renode_can_t));
+    (*can)->machine = machine;
+    (*can)->id = id;
+
+    return NO_ERROR;
+}
+
+renode_error_t *renode_send_can_message(renode_can_t *can, void *packet, int packet_length, uint32_t packet_id)
+{
+    canbus_command_t cmd = {
+        .header = {
+         .id = can->id,
+         .command = SEND_FRAME,
+         },
+        .packet_length = packet_length,
+        .id = packet_id,
+    };
+
+    return_error_if_fails(renode_connection_send_request(can->machine->renode->conn, generic_response_handler, &cmd,
+        REQUEST_HEADER(CAN_BUS), 
+        {&cmd.header, sizeof(cmd.header)},
+        {&cmd.packet_length, sizeof(cmd.packet_length)},
+        {&cmd.id, sizeof(cmd.id)},
+        {packet, packet_length},
+        ));
+
+    return NO_ERROR;
+}
+
+renode_error_t *renode_register_can_callback(renode_can_t *can, void *user_data, void (*callback)(void *, renode_can_event_data_t *))
+{
+    int32_t ed;
+    return_error_if_fails(register_callback((raw_callback_t)callback, user_data, &ed));
+
+    canbus_command_t cmd = {
+        .header = {
+            .command = REGISTER_CALLBACKS,
+        },
+    };
+
+    return renode_connection_send_request(can->machine->renode->conn, generic_response_handler, &cmd,
+        REQUEST_HEADER(CAN_BUS),
         {&cmd.header, sizeof(cmd.header)},
         {&ed, sizeof(ed)},
     );
@@ -617,7 +738,7 @@ renode_error_t *renode_get_bus_context_name(renode_bus_context_t *ctx, char **na
     command_data.operation = SYSBUS_GET_NAME;
 
     // ASSUMPTION: Obtaining the name cannot generate side-effects
-    return renode_connection_send(ctx->machine->renode->conn, get_bus_context_name_handler, name,
+    return renode_connection_send_request(ctx->machine->renode->conn, get_bus_context_name_handler, name,
         REQUEST_HEADER(SYSTEM_BUS),
         {&command_data, sizeof(command_data)},
     );
@@ -668,7 +789,7 @@ renode_error_t *renode_sysbus_read(renode_bus_context_t *ctx, uint64_t address, 
     };
     return_error_if_fails(renode_get_byte_count(width, count, &cmd.data_size));
 
-    return renode_connection_send(ctx->machine->renode->conn, generic_handler, &cmd,
+    return renode_connection_send_request(ctx->machine->renode->conn, generic_response_handler, &cmd,
         REQUEST_HEADER(SYSTEM_BUS),
         {&cmd.header, sizeof(cmd.header)},
     );
@@ -689,7 +810,7 @@ renode_error_t *renode_sysbus_write(renode_bus_context_t *ctx, uint64_t address,
     uint32_t data_bytes;
     return_error_if_fails(renode_get_byte_count(width, count, &data_bytes));
 
-    return renode_connection_send(ctx->machine->renode->conn, generic_handler, &cmd,
+    return renode_connection_send_request(ctx->machine->renode->conn, generic_response_handler, &cmd,
         REQUEST_HEADER(SYSTEM_BUS),
         {&cmd.header, sizeof(cmd.header)},
         {buffer, data_bytes},
@@ -708,7 +829,6 @@ static renode_error_t *parse_response(const void *response, size_t size, message
 
     switch(header->type) {
     case TYPE_REQUEST:
-        return create_fatal_error_static("Current client implementation cannot service direct requests");
     case TYPE_SUCCESS:
     case TYPE_EVENT_REQUEST:
         *data = response;
@@ -732,7 +852,29 @@ static renode_error_t *parse_response(const void *response, size_t size, message
     }
 }
 
-static renode_error_t *generic_handler(renode_connection_t *conn, const void *response, size_t size, void *ud)
+static renode_error_t *generic_request_handler(renode_connection_t *conn, uint16_t id, const void *response, size_t size, void *ud)
+{
+    (void)ud;
+
+    message_payload_t header;
+    const void *data = NULL;
+    uint32_t data_size = 0;
+
+    return_error_if_fails(parse_response(response, size, &header, &data, &data_size));
+
+    assert_msg(header.type == TYPE_EVENT_REQUEST || header.type == TYPE_REQUEST, "Tried to invoke a request handler with a response");
+
+    if (header.type == TYPE_EVENT_REQUEST) {
+        int32_t ed;
+        assert_fmsg(sizeof(ed) <= data_size, "Expected at least %zu bytes of an event descriptor, but got only %zu", sizeof(ed), size);
+        memcpy(&ed, data, sizeof(ed));
+        return invoke_callback(conn, id, header.command, ed, data + sizeof(ed), data_size - sizeof(ed));
+    }
+
+    return create_fatal_error_static("Current client implementation cannot service direct requests");
+}
+
+static renode_error_t *generic_response_handler(renode_connection_t *conn, const void *response, size_t size, void *ud)
 {
     message_payload_t header;
     const void *data = NULL;
@@ -740,12 +882,7 @@ static renode_error_t *generic_handler(renode_connection_t *conn, const void *re
 
     return_error_if_fails(parse_response(response, size, &header, &data, &data_size));
 
-    if (header.type == TYPE_EVENT_REQUEST) {
-        int32_t ed;
-        assert_fmsg(sizeof(ed) <= data_size, "Expected at least %zu bytes of an event descriptor, but got only %zu", sizeof(ed), size);
-        memcpy(&ed, data, sizeof(ed));
-        return invoke_callback(header.command, ed, data + sizeof(ed), data_size - sizeof(ed));
-    }
+    assert_msg(header.type != TYPE_EVENT_REQUEST && header.type != TYPE_REQUEST, "Tried to invoke a response handler with a request");
 
     switch (header.command) {
     case RUN_FOR:
@@ -760,7 +897,47 @@ static renode_error_t *generic_handler(renode_connection_t *conn, const void *re
         return gpio_handler(conn, data, data_size, ud);
     case SYSTEM_BUS:
         return sysbus_handler(conn, data, data_size, ud);
+    case TIME_ELAPSED_CALLBACK:
+        return NO_ERROR; // This command doesn't return any data, we only care about a successful status
+    case SPI:
+        return NO_ERROR; // This command doesn't return any data, we only care about a successful status
+    case CAN_BUS:
+        return NO_ERROR; // This command doesn't return any data, we only care about a successful status
     default:
         return create_fatal_error_static("Encountered a command without a response handler");
     }
+}
+
+renode_error_t *renode_get_spi(renode_machine_t *machine, const char *name, renode_spi_t **spi)
+{
+    int32_t id;
+    return_error_if_fails(renode_get_instance_descriptor(machine, SPI, name, &id));
+
+    *spi = xmalloc(sizeof(renode_spi_t));
+    (*spi)->machine = machine;
+    (*spi)->id = id;
+    (*spi)->user_data = NULL;
+    (*spi)->on_transmit = NULL;
+    (*spi)->on_finish = NULL;
+
+    return NO_ERROR;
+}
+
+renode_error_t *renode_spi_register_callbacks(renode_spi_t *spi, void *user_data,
+    renode_spi_transmit_callback_t on_transmit, renode_spi_finish_callback_t on_finish)
+{
+    spi->user_data = user_data;
+    spi->on_transmit = on_transmit;
+    spi->on_finish = on_finish;
+
+    int32_t ed;
+    return_error_if_fails(register_callback(NULL, spi, &ed));
+
+    assert_msg(on_transmit != NULL, "spi on_transmit callback cannot be null");
+
+    return renode_connection_send_request(spi->machine->renode->conn, generic_response_handler, NULL,
+        REQUEST_HEADER(SPI),
+        {&spi->id, sizeof(spi->id)},
+        {&ed, sizeof(ed)},
+    );
 }

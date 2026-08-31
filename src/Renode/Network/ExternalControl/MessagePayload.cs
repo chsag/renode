@@ -51,23 +51,33 @@ namespace Antmicro.Renode.Network.ExternalControl
             return new MessagePayload(command, CommandType.EventRequest, BitConverter.GetBytes(eventId).Concat(payload.AsRawBytes()).ToArray());
         }
 
-        public static bool TryDecode(Message header, out MessagePayload cmdData)
+        public static MessagePayload Event<T>(Command command, int eventId, T payloadHeader, byte[] data) where T : struct
         {
-            if(header.Data.Length < HeaderSize)
-            {
-                cmdData = default;
-                return false;
-            }
+            return new MessagePayload(command, CommandType.EventRequest,
+            BitConverter.GetBytes(eventId)
+                .Concat(payloadHeader.AsRawBytes())
+                .Concat(data).ToArray());
+        }
 
-            Span<byte> data = header.Data;
-            var cmd = (Command)BitConverter.ToUInt16(data[..sizeof(ushort)]);
-            cmdData = new MessagePayload(cmd, (CommandType)data[2], data[HeaderSize..].ToArray());
-            return true;
+        public MessagePayload(Command cmd, CommandType type, byte[] data)
+        {
+            Command = cmd;
+            Type = type;
+            Data = data;
         }
 
         public IEnumerable<byte> ToBytes() => BitConverter.GetBytes((ushort)Command).Concat([(byte)Type]).Concat(Data);
 
-        public override string ToString() => $"{nameof(MessagePayload)}(Command={Command}, Type={Type}, Data={Misc.PrettyPrintCollectionHex(Data)})";
+        public int GetSize() => HeaderSize + Data.Length;
+
+        public override string ToString() => ToCustomString();
+
+        public string ToCustomString(bool withData = true)
+        {
+            var dataString = withData ? Misc.PrettyPrintCollectionHex(Data) : "[...]";
+
+            return $"{nameof(MessagePayload)}(Command={Command}, Type={Type}, {dataString})";
+        }
 
         public Command Command { get; }
 
@@ -76,12 +86,5 @@ namespace Antmicro.Renode.Network.ExternalControl
         public byte[] Data { get; }
 
         public const int HeaderSize = sizeof(Command) + sizeof(CommandType);
-
-        private MessagePayload(Command cmd, CommandType type, byte[] data)
-        {
-            Command = cmd;
-            Type = type;
-            Data = data;
-        }
     }
 }

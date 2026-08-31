@@ -22,6 +22,7 @@ typedef struct {
     pthread_cond_t cond;
     void *data;
     size_t data_size;
+    uint16_t message_id;
 } channel_t;
 
 static renode_error_t *channel_init(channel_t *c)
@@ -39,6 +40,7 @@ static renode_error_t *channel_init(channel_t *c)
 
     c->data = NULL;
     c->data_size = 0;
+    c->message_id = 0;
     return NO_ERROR;
 }
 
@@ -50,21 +52,32 @@ static void channel_destroy(channel_t *c)
     *c = (channel_t){};
 }
 
-static void channel_get(channel_t *c, void **data, size_t *size)
+static void channel_mutex_unlock_cleanup(void *lock)
+{
+    pthread_mutex_unlock((pthread_mutex_t *)lock);
+}
+
+static void channel_get(channel_t *c, void **data, size_t *size, uint16_t *id)
 {
     pthread_mutex_lock(&c->lock);
+    pthread_cleanup_push(channel_mutex_unlock_cleanup, &c->lock);
+
     while (c->data == NULL) {
         pthread_cond_wait(&c->cond, &c->lock);
     }
 
     *data = c->data;
     *size = c->data_size;
+    *id = c->message_id;
     c->data = NULL;
     c->data_size = 0;
-    pthread_mutex_unlock(&c->lock);
+    c->message_id = 0;
+
+    // Unlock the mutex if cancellation was not triggered
+    pthread_cleanup_pop(1);
 }
 
-static renode_error_t *channel_put(channel_t *c, void *data, size_t data_size)
+static renode_error_t *channel_put(channel_t *c, void *data, size_t data_size, uint16_t id)
 {
     renode_error_t *err = NO_ERROR;
     pthread_mutex_lock(&c->lock);
@@ -74,6 +87,7 @@ static renode_error_t *channel_put(channel_t *c, void *data, size_t data_size)
 
     c->data = data;
     c->data_size = data_size;
+    c->message_id = id;
     pthread_cond_signal(&c->cond);
     pthread_mutex_unlock(&c->lock);
     return err;
@@ -137,14 +151,23 @@ struct renode_connection {
 
     int socket_fd;
 
+    pthread_mutex_t lifecycle_lock;
+    bool disposed;
+    int active_handler_count;
+
     pthread_t receiver_thread;
+    pthread_t default_handler_thread;
+
+    renode_server_request_t request_callback;
+    void* default_handler_ud;
 
     pthread_mutex_t client_request_lock;
+    pthread_mutex_t send_message_lock;
     channel_t client_responses;
     uint16_t client_next_request_id;
+    uint16_t server_next_request_id;
 
-    // TODO: Implement
-    // channel_t server_requests;
+    channel_t server_requests;
 };
 
 static void check_and_handle_async_error(renode_connection_t *conn, renode_error_t *err)
@@ -179,6 +202,14 @@ static void *receiver_thread(void *ud)
         uint8_t temp;
         ssize_t received = recv(conn->socket_fd, &temp, sizeof(temp), MSG_PEEK);
         if (received < 0) {
+            pthread_mutex_lock(&conn->lifecycle_lock);
+            if (conn->disposed) {
+                // Ignore the error, since we are disposing of the connection anyway
+                verbose_print("Socket error while disposing of the connection: %s (socket_fd = %d)", strerror(errno), conn->socket_fd);
+                pthread_mutex_unlock(&conn->lifecycle_lock);
+                return NULL;
+            }
+            pthread_mutex_unlock(&conn->lifecycle_lock);
             check_and_handle_async_error(conn, create_fatal_error("Socket reception error: %s (socket_fd = %d)", strerror(errno), conn->socket_fd));
         }
 
@@ -198,11 +229,55 @@ static void *receiver_thread(void *ud)
         check_and_handle_async_error(conn, read_or_fail(conn->socket_fd, buffer, envelope.data_size));
 
         if ((envelope.id & CLIENT_INITIATED) == CLIENT_INITIATED) {
-            check_and_handle_async_error(conn, channel_put(&conn->client_responses, buffer, envelope.data_size));
+            check_and_handle_async_error(conn, channel_put(&conn->client_responses, buffer, envelope.data_size, envelope.id));
         } else {
-            assert_exit(!"Handling server initiated requests it not yet supported");
+            check_and_handle_async_error(conn, channel_put(&conn->server_requests, buffer, envelope.data_size, envelope.id));
         }
     }
+}
+
+static void *default_handler_thread(void *ud)
+{
+    renode_connection_t* conn = ud;
+    renode_server_request_t handler = conn->request_callback;
+    void *ud_ptr = conn->default_handler_ud;
+
+    void *data;
+    size_t size;
+    uint16_t id;
+
+    while (true) {
+        // Enable cancellation while waiting for a server request
+        pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+        pthread_testcancel();
+
+        // Wait for a request from the server
+        channel_get(&conn->server_requests, &data, &size, &id);
+
+        // Disable cancellation
+        // POSIX does not allow NULL but most implementations do
+        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+
+        pthread_mutex_lock(&conn->lifecycle_lock);
+        conn->active_handler_count += 1;
+        pthread_mutex_unlock(&conn->lifecycle_lock);
+
+        renode_error_t* error = handler(conn, id, data, size, ud_ptr);
+
+        pthread_mutex_lock(&conn->lifecycle_lock);
+        conn->active_handler_count -= 1;
+        pthread_mutex_unlock(&conn->lifecycle_lock);
+
+        if (error != NO_ERROR) {
+            fprintf(stderr, "Default handler callback failed with: %s\n", error->message);
+            fflush(stderr);
+            renode_free_error(error);
+        }
+
+        free(data);
+    }
+
+    return NULL;
 }
 
 renode_error_t *renode_connection_open(renode_connection_t **conn, const renode_connection_config_t *cfg)
@@ -241,65 +316,169 @@ renode_error_t *renode_connection_open(renode_connection_t **conn, const renode_
         if (setsockopt(socket_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay_value, sizeof(nodelay_value)) != 0) {
             verbose_print("Failed to set TCP_NODELAY on the socket: %s", strerror(errno));
         }
-
-        renode_connection_t *result = xmalloc(sizeof(renode_connection_t));
-        result->socket_fd = socket_fd;
-        result->fatal_error_callback = NULL;
-        result->fatal_error_ud = NULL;
-        result->client_next_request_id = 0;
-
-        pthread_mutexattr_t mutex_attr;
-        pthread_mutexattr_init(&mutex_attr);
-        pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_RECURSIVE);
-        int thread_error = pthread_mutex_init(&result->client_request_lock, &mutex_attr);
-        pthread_mutexattr_destroy(&mutex_attr);
-
-        if (thread_error != 0) {
-            close(result->socket_fd);
-            free(result);
-            return create_fatal_error("Failed to create a mutex: %s", strerror(thread_error));
-        }
-
-        renode_error_t *channel_err = channel_init(&result->client_responses);
-        if (channel_err != NO_ERROR) {
-            close(result->socket_fd);
-            pthread_mutex_destroy(&result->client_request_lock);
-            free(result);
-            return channel_err;
-        }
-
-        thread_error = pthread_create(&result->receiver_thread, NULL, receiver_thread, result);
-        if (thread_error != 0) {
-            close(result->socket_fd);
-            pthread_mutex_destroy(&result->client_request_lock);
-            channel_destroy(&result->client_responses);
-            free(result);
-            return create_fatal_error("Failed to create the RX thread: %s", strerror(thread_error));
-        }
-
-        *conn = result;
-        freeaddrinfo(results);
-        return NO_ERROR;
+        break;
     }
 
     freeaddrinfo(results);
-    return create_error(ERR_FATAL, "Failed to connect to a Renode external API control server at %s:%s."
-        "Make sure the server in Renode has been started with: `" SERVER_START_COMMAND " %s` and the port is accessible to this application",
-        cfg->address, cfg->port, cfg->port);
+
+    if (socket_fd == -1) {
+        return create_error(ERR_FATAL, "Failed to connect to a Renode external API control server at %s:%s."
+            "Make sure the server in Renode has been started with: `" SERVER_START_COMMAND " %s` and the port is accessible to this application",
+            cfg->address, cfg->port, cfg->port);
+    }
+
+    renode_connection_t *result = xmalloc(sizeof(renode_connection_t));
+    result->socket_fd = socket_fd;
+    result->disposed = false;
+    result->active_handler_count = 0;
+    result->fatal_error_callback = NULL;
+    result->fatal_error_ud = NULL;
+    result->client_next_request_id = 0;
+    result->server_next_request_id = 0;
+
+    renode_error_t *ret_err = NO_ERROR;
+    bool have_mutex = false;
+    bool have_send_mutex = false;
+    bool have_lifecycle_mutex = false;
+    bool have_client_responses = false;
+    bool have_server_requests = false;
+    bool have_receiver_thread = false;
+    bool have_default_handler_thread = false;
+
+    pthread_mutexattr_t mutex_attr;
+    pthread_mutexattr_init(&mutex_attr);
+    pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_RECURSIVE);
+    int thread_error = pthread_mutex_init(&result->client_request_lock, &mutex_attr);
+    pthread_mutexattr_destroy(&mutex_attr);
+    if (thread_error != 0) {
+        ret_err = create_fatal_error("Failed to create a mutex: %s", strerror(thread_error));
+        goto cleanup;
+    }
+    have_mutex = true;
+
+    thread_error = pthread_mutex_init(&result->send_message_lock, NULL);
+    if (thread_error != 0) {
+        ret_err = create_fatal_error("Failed to create a mutex: %s", strerror(thread_error));
+        goto cleanup;
+    }
+    have_send_mutex = true;
+
+    thread_error = pthread_mutex_init(&result->lifecycle_lock, NULL);
+    if (thread_error != 0) {
+        ret_err = create_fatal_error("Failed to create a mutex: %s", strerror(thread_error));
+        goto cleanup;
+    }
+    have_lifecycle_mutex = true;
+
+    ret_err = channel_init(&result->client_responses);
+    if (ret_err != NO_ERROR) {
+        goto cleanup;
+    }
+    have_client_responses = true;
+
+    thread_error = pthread_create(&result->receiver_thread, NULL, receiver_thread, result);
+    if (thread_error != 0) {
+        ret_err = create_fatal_error("Failed to create the RX thread: %s", strerror(thread_error));
+        goto cleanup;
+    }
+    have_receiver_thread = true;
+
+    ret_err = channel_init(&result->server_requests);
+    if (ret_err != NO_ERROR) {
+        goto cleanup;
+    }
+    have_server_requests = true;
+
+    result->request_callback = cfg->request_callback;
+    result->default_handler_ud = cfg->server_request_ud;
+
+    thread_error = pthread_create(&result->default_handler_thread, NULL, default_handler_thread, result);
+    if (thread_error != 0) {
+        ret_err = create_fatal_error("Failed to create the default handler thread: %s", strerror(thread_error));
+        goto cleanup;
+    }
+    have_default_handler_thread = true;
+
+    *conn = result;
+    return NO_ERROR;
+
+cleanup:
+    if (have_receiver_thread) {
+        shutdown(result->socket_fd, SHUT_RDWR);
+        pthread_join(result->receiver_thread, NULL);
+    }
+    if (have_default_handler_thread) {
+        pthread_cancel(result->default_handler_thread);
+        pthread_join(result->default_handler_thread, NULL);
+    }
+    if (have_client_responses) {
+        channel_destroy(&result->client_responses);
+    }
+    if (have_server_requests) {
+        channel_destroy(&result->server_requests);
+    }
+    if (have_mutex) {
+        pthread_mutex_destroy(&result->client_request_lock);
+    }
+    if (have_send_mutex) {
+        pthread_mutex_destroy(&result->send_message_lock);
+    }
+    if (have_lifecycle_mutex) {
+        pthread_mutex_destroy(&result->lifecycle_lock);
+    }
+    close(result->socket_fd);
+    free(result);
+    return ret_err;
 }
 
-renode_error_t *renode_connection_close(renode_connection_t *con)
+static renode_error_t *renode_connection_close_impl(renode_connection_t *con)
 {
-    assert(con);
+    pthread_mutex_lock(&con->lifecycle_lock);
+    if (con->active_handler_count > 0) {
+        pthread_mutex_unlock(&con->lifecycle_lock);
+        return create_error_static(ERR_CONNECTION_BUSY, "Cannot close a connection while handlers are running");
+    }
+
+    if (con->disposed) {
+        pthread_mutex_unlock(&con->lifecycle_lock);
+        return create_error_static(ERR_FATAL, "This Renode connection has already been closed");
+    }
+
+    con->disposed = true;
+    pthread_mutex_unlock(&con->lifecycle_lock);
 
     // `shutdown` is called to interrupt the `recv` call in the RX thread
     shutdown(con->socket_fd, SHUT_RDWR);
     pthread_join(con->receiver_thread, NULL);
     close(con->socket_fd);
+
+    // Stop the default handler thread
+    pthread_cancel(con->default_handler_thread);
+    pthread_join(con->default_handler_thread, NULL);
+
     pthread_mutex_destroy(&con->client_request_lock);
     channel_destroy(&con->client_responses);
+    channel_destroy(&con->server_requests);
+
+    pthread_mutex_destroy(&con->send_message_lock);
+    pthread_mutex_destroy(&con->lifecycle_lock);
+
     free(con);
 
+    return NO_ERROR;
+}
+
+renode_error_t *renode_connection_close(renode_connection_t *con, bool blocking)
+{
+    assert(con);
+
+    renode_error_t *err;
+    while ((err = renode_connection_close_impl(con)) != NO_ERROR) {
+        if (!blocking || err->code != ERR_CONNECTION_BUSY) {
+            return err;
+        }
+        renode_free_error(err);
+    }
     return NO_ERROR;
 }
 
@@ -309,30 +488,106 @@ void renode_connection_set_fatal_error_callback(renode_connection_t *conn, renod
     conn->fatal_error_ud = ud;
 }
 
-renode_error_t *renode_connection_send_impl(renode_connection_t *conn, renode_connection_response_t cb, void *ud, const renode_connection_transfer_t *transfers, size_t count)
+renode_error_t *renode_connection_send_request_impl(renode_connection_t *conn, renode_connection_response_t cb, void *ud, const renode_connection_transfer_t *transfers, size_t count)
 {
     renode_error_t *err = NO_ERROR;
 
-    pthread_mutex_lock(&conn->client_request_lock); // Only 1 thread can start a request chain
+    bool from_default_handler_thread = pthread_equal(pthread_self(), conn->default_handler_thread);
+
+    if(!from_default_handler_thread) {
+        pthread_mutex_lock(&conn->client_request_lock); // Only 1 thread can start a request chain
+    }
+
+    uint16_t request_message_id;
+    if(from_default_handler_thread) {
+        request_message_id = ~CLIENT_INITIATED & conn->server_next_request_id++;
+    }
+    else {
+        request_message_id = CLIENT_INITIATED | conn->client_next_request_id++;
+    }
+
+    err = renode_connection_send_message_impl(conn, request_message_id, transfers, count);
+    if (err != NO_ERROR) {
+        goto release_locks;
+    }
+
+    // Wait for a response from the server
+    void *data;
+    size_t size;
+    uint16_t id;
+    message_payload_t **header = (message_payload_t **)&data;
+    if (from_default_handler_thread) {
+        channel_get(&conn->server_requests, &data, &size, &id);
+    } else {
+        channel_get(&conn->client_responses, &data, &size, &id);
+    }
+
+
+    pthread_mutex_lock(&conn->lifecycle_lock);
+    conn->active_handler_count += 1;
+    pthread_mutex_unlock(&conn->lifecycle_lock);
+
+    while((*header)->type == TYPE_EVENT_REQUEST || (*header)->type == TYPE_REQUEST) {
+        // Handle the request
+        err = conn->request_callback(conn, id, data, size, ud);
+        free(data);
+
+        // Wait for a response from the server to the original request, or another request
+        channel_get(&conn->client_responses, &data, &size, &id);
+    }
+
+    if (id != request_message_id) {
+        err = create_fatal_error_static("Response ID does not match request ID");
+        goto release_locks;
+    }
+
+    // Handle the response - while holding the request_lock to enable nested requests
+    err = cb(conn, data, size, ud);
+
+    pthread_mutex_lock(&conn->lifecycle_lock);
+    conn->active_handler_count -= 1;
+    pthread_mutex_unlock(&conn->lifecycle_lock);
+
+    free(data);
+
+release_locks:
+    if(!from_default_handler_thread) {
+        pthread_mutex_unlock(&conn->client_request_lock);
+    }
+    return err;
+}
+
+renode_error_t *renode_connection_send_message_impl(renode_connection_t *conn, uint16_t id, const renode_connection_transfer_t *transfers, size_t count)
+{
+    pthread_mutex_lock(&conn->lifecycle_lock);
+    if (conn->disposed) {
+        pthread_mutex_unlock(&conn->lifecycle_lock);
+        return create_fatal_error_static("This Renode connection has been disposed of");
+    }
+    pthread_mutex_unlock(&conn->lifecycle_lock);
+
+    renode_error_t *err = NO_ERROR;
 
     message_t envelope = {
-        .id = CLIENT_INITIATED | (conn->client_next_request_id++),
+        .id = id,
         .data_size = 0,
     };
 
-    for(size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < count; i++) {
         if (envelope.data_size + transfers[i].byte_count < envelope.data_size) {
             err = create_fatal_error_static("Transfer buffer size overflow");
-            goto release_locks;
+            return err;
         }
         envelope.data_size += transfers[i].byte_count;
     }
+
+    pthread_mutex_lock(&conn->send_message_lock);
 
     if ((err = write_or_fail(conn->socket_fd, &envelope, sizeof(envelope))) != NO_ERROR) {
         goto release_locks;
     }
 
-    for(size_t i = 0; i < count; i++) {
+    for (size_t i = 0; i < count; i++) {
         // Write the request chunks
         err = write_or_fail(conn->socket_fd, transfers[i].data, transfers[i].byte_count);
         if (err != NO_ERROR) {
@@ -340,17 +595,7 @@ renode_error_t *renode_connection_send_impl(renode_connection_t *conn, renode_co
         }
     }
 
-    // Wait for a response from the server
-    void *data;
-    size_t size;
-    channel_get(&conn->client_responses, &data, &size);
-
-    // Handle the response - while holding the request_lock to enable nested requests
-    err = cb(conn, data, size, ud);
-
-    free(data);
-
 release_locks:
-    pthread_mutex_unlock(&conn->client_request_lock);
+    pthread_mutex_unlock(&conn->send_message_lock);
     return err;
 }

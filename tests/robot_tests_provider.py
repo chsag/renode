@@ -1070,7 +1070,7 @@ class RobotTestSuite(object):
             for test_name in (t[0] for t in test_cases):
                 deps.update(self._get_dependencies(test_name))
             if not self._run_dependencies(deps, options, iteration_index, suite_retry_index):
-                return False
+                return TestResult(False, None)
 
         # Listeners are called in the exact order as in `listeners` list for both `start_test` and `end_test`.
         output_formatter = 'robot_output_formatter_verbose.py' if options.verbose else 'robot_output_formatter.py'
@@ -1092,7 +1092,7 @@ class RobotTestSuite(object):
 
         for test in suite.tests:
             if not test.setup:
-                test.setup.config(name="Reset Emulation")
+                test.setup.config(name="Test Setup")
             if not test.teardown:
                 test.teardown.config(name="Test Teardown")
 
@@ -1156,7 +1156,8 @@ class RobotTestSuite(object):
                 # Tests with unexpected timeouts won't be retried.
                 self.tests_with_unexpected_timeouts = test.name
             print(f"{message_start} after {Time(test.timeout).seconds}s: {test.parent.name}.{test.name}")
-            print(f"----- Skipped flushing emulation log and saving state due to the timeout, restarting Renode...")
+            BuiltIn().run_keyword("Print Log Saved Message")
+            print(f"----- Skipped saving state due to the timeout, restarting Renode...")
 
             self._close_remote_server(RobotTestSuite.robot_frontend_process, options)
             RobotTestSuite.robot_frontend_process = self._run_remote_server(options, iteration_index, suite_retry_index)

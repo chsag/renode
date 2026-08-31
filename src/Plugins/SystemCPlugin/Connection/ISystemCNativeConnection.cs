@@ -9,15 +9,13 @@ namespace Antmicro.Renode.Peripherals.SystemC
 {
     public unsafe interface ISystemCNativeConnection
     {
-        void* RenodeBridgeRef { get; set; }
+        void* RenodeConnectionRef { get; set; }
 
         delegate* unmanaged<void*, RenodeMessage, void> SendBackwardResponseNative { get; set; }
 
         delegate* unmanaged<void*, DMIMessage, void> SendBackwardResponseDmiNative { get; set; }
 
         delegate* unmanaged<void*, RenodeMessage, void> SendForwardRequestNative { get; set; }
-
-        delegate* unmanaged<void*, RenodeMessage, RenodeMessage> HandleSidebandForwardRequestNative { get; set; }
 
         void HandleBackwardRequestFromNative(RenodeMessage message);
 

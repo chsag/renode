@@ -1,6 +1,7 @@
 *** Variables ***
 ${PLATFORM}                         platforms/boards/nucleo_h753zi.repl
-${BIN}                              @https://dl.antmicro.com/projects/renode/nucleo_h753zi--zephyr-samples_sensor_pressure_polling.elf-s_794076-b36b2685743abaf24da564d8fc5152ae2dcbb344
+${ZEPHYR420_BIN}                    @https://dl.antmicro.com/projects/renode/nucleo_h753zi--zephyr-samples_sensor_pressure_polling.elf-s_794076-b36b2685743abaf24da564d8fc5152ae2dcbb344
+${ZEPHYR440_BIN}                    @https://dl.antmicro.com/projects/renode/nucleo_h753zi--zephyr-samples_sensor_pressure_polling.elf-s_833608-f8b3cc7af3205f8ab2d322ed79eef4f3324b81b0
 ${UART}                             sysbus.usart3
 ${SENSOR}                           sysbus.i2c1.lps25hb
 ${CSV2RESD}                         ${RENODETOOLS}/csv2resd/csv2resd.py
@@ -8,10 +9,11 @@ ${SAMPLES_CSV}                      ${CURDIR}/LPS25HB-samples.csv
 
 *** Keywords ***
 Create Machine
+    [Arguments]                     ${bin}
     Execute Command                 mach create
     Execute Command                 machine LoadPlatformDescription @${PLATFORM}
     Execute Command                 machine LoadPlatformDescriptionFromString "lps25hb: Sensors.LPS25HB @ i2c1 0x5D"
-    Execute Command                 sysbus LoadELF @${BIN}
+    Execute Command                 sysbus LoadELF @${bin}
     Execute Command                 cpu EnableZephyrMode
     Create Terminal Tester          ${UART}
 
@@ -23,7 +25,7 @@ Set Environment
 Check Environment
     [Arguments]                     ${temperature}=0.74  ${pressure}=1013.25
     ${pressure}=                    Evaluate  "{:.6f}".format(float(${pressure})/10.0)  # hPa to kPa conversion
-    Wait For Line On Uart           .* temp ${temperature} Cel, pressure ${pressure} kPa, .*  treatAsRegex=true  timeout=0.1
+    Wait For Line On Uart           temp ${temperature} Cel, pressure ${pressure} kPa.*  treatAsRegex=true  timeout=1
 
 Create RESD File
     [Arguments]                     ${path}
@@ -56,7 +58,7 @@ Read Registers
 
 *** Test Cases ***
 Should Read Temperature And Pressure
-    Create Machine
+    Create Machine                  ${ZEPHYR420_BIN}
 
     # Due the finite precision of the sensor, and a overflow in Zephyr implementation,
     # we don't always expect the exact same values as the ones that where set
@@ -92,7 +94,7 @@ Should Read Temperature And Pressure
     Check Environment               temperature=100.31
 
 Should Correctly Calculate Pressure
-    Create Machine
+    Create Machine                  ${ZEPHYR420_BIN}
 
     ${expected_pressure}=           Set Variable  1023.346923828125
     Execute Command                 ${SENSOR} Pressure ${expected_pressure}
@@ -104,7 +106,7 @@ Should Correctly Calculate Pressure
     Should Be Equal As Strings      ${pressure_bytes}  [0x8D, 0xF5, 0x3F]
 
 Should Read Samples From RESD
-    Create Machine
+    Create Machine                  ${ZEPHYR420_BIN}
 
     ${resd_path}=                   Create RESD File  ${SAMPLES_CSV}
 
@@ -124,3 +126,9 @@ Should Read Samples From RESD
     # Sensor should go back to set values after the RESD file finishes
     Check Environment               temperature=42.50  pressure=1013.25
     Check Environment               temperature=42.50  pressure=1013.25
+
+Should Work After Errata Driver Update
+    Create Machine                  ${ZEPHYR440_BIN}
+
+    Set Environment                 temperature=100.0
+    Check Environment               temperature=100.31
