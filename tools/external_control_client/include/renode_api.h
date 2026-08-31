@@ -26,6 +26,7 @@ typedef enum {
     ERR_COMMAND_FAILED, /**< command failed */
     ERR_INVALID_COMMAND, /**< invalid command */
     ERR_INVALID_ARGUMENT, /**< function called with invalid argument */
+    ERR_CONNECTION_BUSY, /**< Renode connection is busy and cannot be closed */
 } renode_error_code_t;
 
 /**
@@ -82,6 +83,13 @@ typedef struct renode_adc renode_adc_t;
 typedef struct renode_gpio renode_gpio_t;
 
 /**
+ * @brief Renode CAN bus API handle
+ *
+ * @copydetails renode_t
+ */
+typedef struct renode_can renode_can_t;
+
+/**
  * @brief Renode bus manager API handle
  *
  * @copydetails renode_t
@@ -92,6 +100,13 @@ typedef struct renode_bus_context renode_bus_context_t;
  * @brief Type of the Renode fatal error callback
  */
 typedef void (*renode_fatal_error_callback_t)(void *ud, renode_error_t *error);
+
+/**
+ * @brief Renode SPI peripheral API handle
+ *
+ * @copydetails renode_t
+ */
+typedef struct renode_spi renode_spi_t;
 
 /**
  * @brief Function initializing Renode connection
@@ -113,6 +128,19 @@ renode_error_t *renode_connect(const char *port, renode_t **renode);
  * @return a pointer to error structure if error occurred, otherwise NULL
  */
 renode_error_t *renode_disconnect(renode_t **renode);
+
+/**
+ * @brief Extended variant of the function closing Renode connection and freeing internal handle memory
+ *
+ * @note The internal handle memory is freed so calling `free(*renode)` after calling this function is invalid.
+ *
+ * @param[in] renode Renode connection handle pointer
+ * @param[in] blocking if false the function may return an error with code `ERR_CONNECTION_BUSY` to indicate
+ * that connection cannot be closed at this momment due to the fact that command handlers are currently running.
+ * if true this function will block in case where `ERR_CONNECTION_BUSY` would be returned.
+ * @return a pointer to error structure if error occurred, otherwise NULL
+ */
+renode_error_t *renode_disconnect_ex(renode_t **renode, bool blocking);
 
 /**
  * @brief Function preparing machine handle
@@ -223,6 +251,20 @@ renode_error_t *renode_run_for(renode_t *renode, renode_time_t time);
  */
 renode_error_t *renode_get_current_time(renode_t *renode, renode_time_t *current_time);
 
+/**
+ * @brief Type of the Renode time elapsed callback
+ */
+typedef void (*renode_time_elapsed_callback_t)(void *ud, renode_time_t *timestamp);
+
+/**
+ * @brief Function registering a callback, that will be called after a quantum of time elapses in Renode
+ *
+ * @param[in] renode Renode connection handle
+ * @param[in] user_data pointer to data passed to the callback when it's invoked
+ * @param[in] callback callback to be invoked when a quantum of time elapses in Renode
+ * @return a pointer to error structure if error occurred, otherwise NULL
+ */
+renode_error_t *renode_register_time_elapsed_callback(renode_t *renode, void *user_data, renode_time_elapsed_callback_t callback);
 /* ADC */
 
 /**
@@ -323,6 +365,54 @@ typedef struct {
 renode_error_t *renode_register_gpio_state_change_callback(renode_gpio_t *gpio, int32_t id, void *user_data, void (*callback)(void *, renode_gpio_event_data_t *));
 
 
+/* CAN */
+
+#define MAX_CAN_FRAME_SIZE 64
+
+/**
+ * CAN bus event data
+ */
+typedef struct {
+    renode_time_t time;
+    int32_t packet_length;
+    uint32_t packet_id;
+    uint8_t packet[];
+} renode_can_event_data_t;
+
+/**
+ * @brief Function preparing CAN handle
+ *
+ * @note Handle's internal memory is dynamically allocated so `*can` should be freed when it's no longer used.
+ *
+ * @param[in] machine machine handle
+ * @param[in] name CANBus name
+ * @param[out] can handle associated with the requested CAN instance
+ * @return a pointer to error structure if error occurred, otherwise NULL
+ */
+renode_error_t *renode_get_can(renode_machine_t *machine, const char *name, renode_can_t **can);
+
+/**
+ * @brief Function registering callback when CAN message is received
+ *
+ * @param[in] can CAN instance handle
+ * @param[in] user_data pointer to data passed to the callback when it's invoked
+ * @param[in] callback callback to be invoked when message is received
+ * @return a pointer to error structure if error occurred, otherwise NULL
+ */
+renode_error_t *renode_register_can_callback(renode_can_t *can, void *user_data, void (*callback)(void *, renode_can_event_data_t *));
+
+/**
+ * @brief Function sending CAN message
+ *
+ * @param[in] can CAN instance handle
+ * @param[in] packet pointer to fixed size, 64 byte can packet array
+ * @param[in] packet_length length of send packet
+ * @param[in] packet_id packet_id
+ * @return a pointer to error structure if error occurred, otherwise NULL
+ */
+renode_error_t *renode_send_can_message(renode_can_t *can, void *packet, int packet_length, uint32_t packet_id);
+ 
+
 /* System bus */
 
 /**
@@ -411,3 +501,52 @@ renode_error_t *renode_sysbus_read(renode_bus_context_t *ctx, uint64_t address, 
  * @return a pointer to error structure if error occurred, otherwise NULL
  */
 renode_error_t *renode_sysbus_write(renode_bus_context_t *ctx, uint64_t address, renode_access_width_t width, const void *buffer, uint32_t count);
+
+/* SPI */
+
+/**
+ * @brief Function preparing SPI peripheral handle
+ *
+ * The peripheral must be a `SPI.ExternalControlSPIPeripheral`
+ *
+ * @note Handle's internal memory is dynamically allocated so `*spi` should be freed when it's no longer used.
+ *
+ * @param[in] machine machine handle
+ * @param[in] name SPI peripheral's name
+ * @param[out] spi handle associated with the requested SPI peripheral
+ * @return a pointer to error structure if error occurred, otherwise NULL
+ */
+renode_error_t *renode_get_spi(renode_machine_t *machine, const char *name, renode_spi_t **spi);
+
+/**
+ * SPI transmit callback: invoked for every byte the master sends to the slave (MOSI).
+ * Returns the byte the slave puts on the bus in exchange (MISO) for that beat.
+ *
+ * @param[in] user_data pointer passed at registration
+ * @param[in] mosi the byte received from the master
+ * @return the MISO byte to return to the master
+ */
+typedef uint8_t (*renode_spi_transmit_callback_t)(void *user_data, uint8_t mosi);
+
+/**
+ * SPI finish-transmission callback: invoked when the master ends the transfer (CS deasserted).
+ *
+ * @param[in] user_data pointer passed at registration
+ */
+typedef void (*renode_spi_finish_callback_t)(void *user_data);
+
+/**
+ * @brief Function registering live callbacks for an ExternalControlSPIPeripheral slave
+ *
+ * After registration, the callbacks fire while the emulation advances (i.e. during
+ * renode_run_for()): `on_transmit` supplies the MISO byte for each master beat, and
+ * `on_finish` is notified at the end of a transfer.
+ *
+ * @param[in] spi SPI handle
+ * @param[in] user_data pointer passed to both callbacks when invoked
+ * @param[in] on_transmit callback returning the MISO byte for each received MOSI byte
+ * @param[in] on_finish callback invoked when the transfer finishes (may be NULL)
+ * @return a pointer to error structure if error occurred, otherwise NULL
+ */
+renode_error_t *renode_spi_register_callbacks(renode_spi_t *spi, void *user_data,
+    renode_spi_transmit_callback_t on_transmit, renode_spi_finish_callback_t on_finish);

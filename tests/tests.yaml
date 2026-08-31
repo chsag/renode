@@ -103,6 +103,7 @@
 - tests/platforms/GR716.robot
 - tests/platforms/MPC5567.robot
 - tests/platforms/xtensa.robot
+- tests/unit-tests/arm-cortex-a-fpu.robot
 - tests/unit-tests/InterruptHooks/arm-m.robot
 - tests/unit-tests/arm-cortex-m-bus-fault.robot
 - tests/unit-tests/arm-cortex-m-fpu.robot
@@ -271,6 +272,11 @@
 - tests/peripherals/LSM6DSO_IMU.robot
 - tests/unit-tests/cpu-pause-halt.robot
 - tests/peripherals/AD4011.robot
+- tests/platforms/ArmExperimental/tgau-zedboard.robot
+- tests/peripherals/STM32H7_RCC.robot
+- tests/unit-tests/hst-mmio.robot
+- tests/peripherals/STM32_UART.robot
+- tests/peripherals/IIS2MDC.robot
 
 - signal_handling:
   - tests/unit-tests/signal_handling.robot

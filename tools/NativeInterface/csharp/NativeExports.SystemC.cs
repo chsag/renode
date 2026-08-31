@@ -129,14 +129,13 @@ struct dmi_native_message {
             }
         }
 
-        [UnmanagedCallersOnly(EntryPoint = "renode_systemc_setup_renode_bridge")]
+        [UnmanagedCallersOnly(EntryPoint = "renode_systemc_setup_connection")]
         [return: DNNE.C99Type("RenodeStatus")]
-        public static NativeStatus SystemCSetupRenodeBridge(
-            [DNNE.C99Type("void*")] void* renodeBridgeRef,
+        public static NativeStatus SystemCSetupConnection(
+            [DNNE.C99Type("void*")] void* renodeConnectionRef,
             [DNNE.C99Type("void*")] delegate* unmanaged<void*, RenodeMessage, void> bwResponseHandler,
             [DNNE.C99Type("void*")] delegate* unmanaged<void*, DMIMessage, void> bwResponseDmiHandler,
             [DNNE.C99Type("void*")] delegate* unmanaged<void*, RenodeMessage, void> fwRequestHandler,
-            [DNNE.C99Type("void*")] delegate* unmanaged<void*, RenodeMessage, RenodeMessage> fwRequestSidebandHandler,
             [DNNE.C99Type("const char *")] byte* machName,
             [DNNE.C99Type("const char *")] byte* periName
         )
@@ -146,11 +145,16 @@ struct dmi_native_message {
                 return NativeStatus.CommandError;
             }
 
-            systemC.RenodeBridgeRef = renodeBridgeRef;
+            if(systemC.RenodeConnectionRef != null)
+            {
+                // An active connection needs to be teardowned first. 
+                return NativeStatus.CommandError;
+            }
+
+            systemC.RenodeConnectionRef = renodeConnectionRef;
             systemC.SendBackwardResponseNative = bwResponseHandler;
             systemC.SendBackwardResponseDmiNative = bwResponseDmiHandler;
             systemC.SendForwardRequestNative = fwRequestHandler;
-            systemC.HandleSidebandForwardRequestNative = fwRequestSidebandHandler;
 
             return NativeStatus.Success;
         }
@@ -209,39 +213,39 @@ struct dmi_native_message {
             }
         }
 
+        [UnmanagedCallersOnly(EntryPoint = "renode_systemc_register_bridge")]
+        [return: DNNE.C99Type("RenodeStatus")]
+        public static NativeStatus SystemCRegisterBridge(
+            [DNNE.C99Type("void*")] void* renodeBridgeRef,
+            [DNNE.C99Type("void*")] delegate* unmanaged<void*, void*, void> regHandler,
+            [DNNE.C99Type("const char *")] byte* machName,
+            [DNNE.C99Type("const char *")] byte* periName
+        )
+        {
+            if(!TryGetSystemCHandle(machName, periName, out var systemC))
+            {
+                return NativeStatus.CommandError;
+            }
+
+            if(systemC.RenodeConnectionRef == null)
+            {
+                // Connection must be configured before registering a bridge.
+                return NativeStatus.CommandError;
+            }
+
+            regHandler(systemC.RenodeConnectionRef, renodeBridgeRef);
+
+            return NativeStatus.Success;
+        }
+
         private static bool TryGetSystemCHandle(byte* machName, byte* periName, out ISystemCNativeConnection systemC)
         {
             systemC = null;
-
-            var machineName = Marshal.PtrToStringUTF8((IntPtr)machName);
-            var peripheralName = Marshal.PtrToStringUTF8((IntPtr)periName);
-
-            if(string.IsNullOrEmpty(machineName) || string.IsNullOrEmpty(peripheralName))
+            if(!Generics.TryGetPeripheral<SystemCPeripheral>(machName, periName, out var p))
             {
                 return false;
             }
-
-            if(EmulationManager.Instance == null)
-            {
-                Console.Error.WriteLine("Emulation Manager instance is not initialized");
-                return false;
-            }
-
-            var e = EmulationManager.Instance.CurrentEmulation;
-
-            if(!e.TryGetMachineByName(machineName, out var m))
-            {
-                Console.Error.WriteLine($"No machine with name {machineName}");
-                return false;
-            }
-
-            if(!m.TryGetByName<SystemCPeripheral>(peripheralName, out var p))
-            {
-                Console.Error.WriteLine($"No peripheral with name {peripheralName}");
-                return false;
-            }
-
-            systemC = p;
+            systemC = (ISystemCNativeConnection)p;
 
             return true;
         }
